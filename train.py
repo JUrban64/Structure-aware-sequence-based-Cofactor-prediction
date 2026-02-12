@@ -1,3 +1,6 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 from sklearn.model_selection import train_test_split
 import torch.optim as optim
@@ -122,20 +125,20 @@ class Trainer:
                 print(f"  → New best AUC: {best_auc:.4f}")
 
 
-# Prepare data
-from torch_geometric.data import Batch
+if __name__ == '__main__':
+    from torch_geometric.data import Batch
 
-# Split dataset
-train_graphs, val_graphs = train_test_split(
-    dataset.graphs, 
-    test_size=0.2, 
-    random_state=42
-)
+    # Split dataset
+    train_graphs, val_graphs = train_test_split(
+        dataset.graphs, 
+        test_size=0.2, 
+        random_state=42
+    )
 
-# Create dataloaders
-train_loader = DataLoader(train_graphs, batch_size=32, shuffle=True)
-val_loader = DataLoader(val_graphs, batch_size=32)
+    # Create dataloaders
+    train_loader = DataLoader(train_graphs, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_graphs, batch_size=32)
 
-# Train
-trainer = Trainer(model, train_loader, val_loader)
-trainer.train(num_epochs=100)
+    # Train
+    trainer = Trainer(model, train_loader, val_loader)
+    trainer.train(num_epochs=100)

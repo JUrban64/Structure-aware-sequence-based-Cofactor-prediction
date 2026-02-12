@@ -6,27 +6,40 @@ Umožňuje trénovat na:
   2. Sekvencích bez struktury (Sequence větev) – mnohem více dat
   3. PDB datech oběma větvemi současně (consistency loss)
 
-Architektura:
-  ┌──────────────────┐     ┌──────────────────────┐
-  │ GNN Branch       │     │ Sequence Branch      │
-  │ (binding site    │     │ (full/partial seq    │
-  │  graph + GAT)    │     │  ESM + 1D-CNN + Attn)│
-  └────────┬─────────┘     └──────────┬───────────┘
-           │ [hidden_dim]             │ [hidden_dim]
-           └──────────┬───────────────┘
-                      ▼
-              ┌───────────────┐
-              │ Shared MLP    │
-              │ Classifier    │
-              └───────┬───────┘
-                      ▼
-                P(binds NAD)
+Architektura (s protein-ligand interakčním grafem):
+
+  ┌────────────────────────────────────────────┐
+  │ GNN Branch (heterogenní graf)              │
+  │                                            │
+  │  Protein nodes ──P-P──▶ GAT ◀──P-L──┐     │
+  │  (1310D → proj)                      │     │
+  │                         GAT ◀──L-L──┐│     │
+  │  Ligand nodes ─────────────────────▶ ││    │
+  │  (36D → proj)                        ▼▼    │
+  │                      attention pooling     │
+  │                      (protein nodes only)  │
+  │                      → graph emb [H]       │
+  └──────────────────────┬─────────────────────┘
+                         │
+  ┌──────────────────────┴──────────────────────┐
+  │              Shared Classifier              │
+  └─────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────┐
+  │ Sequence Branch (beze změny)                │
+  │ ESM → 1D-CNN → Self-Attention → pooling     │
+  └──────────────────────┬──────────────────────┘
+                         │
+                         ▼
+                  P(binds cofactor)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv, global_mean_pool, global_add_pool
+
+from additional_features import LigandFeatures
 
 
 # ============================================================
@@ -128,34 +141,69 @@ class SequenceBranch(nn.Module):
 
 
 # ============================================================
-# GNN BRANCH – pro strukturní data z PDB (stávající logika)
+# GNN BRANCH – heterogenní protein-ligand graf
 # ============================================================
 class GNNBranch(nn.Module):
     """
-    Zpracovává binding site graf (uzly = residues, hrany = kontakty).
-    Stávající GNN logika z BindingSiteNADPredictor.
+    Zpracovává protein-ligand interakční graf.
     
-    Vstup: PyG Batch (x, edge_index, edge_attr, batch)
-    Výstup: graph embedding [batch_size, hidden_dim]
+    Klíčové úpravy oproti homogennímu grafu:
+      - Separate input projection pro protein (1310D) a ligand (36D) uzly
+      - Node type embedding přidaný k uzlovým features
+      - Edge type embedding (P-P=0, P-L=1, L-L=2) 
+      - Attention pooling POUZE přes protein uzly (graf embedding
+        reprezentuje protein, ne ligand)
+    
+    Vstup: PyG Batch s atributy:
+        x, edge_index, edge_attr, batch,
+        node_type [N], edge_type [E],
+        n_protein_nodes, protein_dim, ligand_dim
+    
+    Výstup: graph embedding [batch_size, 2*hidden_dim]
     """
+    
+    # Konstanty
+    NUM_NODE_TYPES = 2   # 0=protein, 1=ligand
+    NUM_EDGE_TYPES = 3   # 0=PP, 1=PL, 2=LL
     
     def __init__(self, node_dim=1310, hidden_dim=256, 
                  num_gnn_layers=3, num_attention_heads=4,
-                 dropout=0.5, use_gat=True):
+                 dropout=0.5, use_gat=True,
+                 ligand_dim=None):
         super().__init__()
         
         self.hidden_dim = hidden_dim
         self.use_gat = use_gat
+        self.node_dim = node_dim  # protein feature dim
         
-        # Input projection
-        self.input_projection = nn.Sequential(
+        if ligand_dim is None:
+            ligand_dim = LigandFeatures.LIGAND_FEAT_DIM  # 36
+        self.ligand_dim = ligand_dim
+        
+        # ---- Separate input projections ----
+        # Protein: 1310D → hidden_dim
+        self.protein_projection = nn.Sequential(
             nn.Linear(node_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
-        # GNN layers
+        # Ligand: 36D → hidden_dim
+        self.ligand_projection = nn.Sequential(
+            nn.Linear(ligand_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # ---- Node type embedding ----
+        self.node_type_embedding = nn.Embedding(self.NUM_NODE_TYPES, hidden_dim)
+        
+        # ---- Edge type embedding ----
+        self.edge_type_embedding = nn.Embedding(self.NUM_EDGE_TYPES, hidden_dim)
+        
+        # ---- GNN layers ----
         self.gnn_layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         
@@ -170,7 +218,7 @@ class GNNBranch(nn.Module):
                 self.gnn_layers.append(GCNConv(hidden_dim, hidden_dim))
                 self.norms.append(nn.LayerNorm(hidden_dim))
         
-        # Multi-head attention pooling
+        # ---- Multi-head attention pooling (přes protein nodes) ----
         self.attention_dim = 128
         self.num_heads = num_attention_heads
         self.W1 = nn.Linear(hidden_dim, self.attention_dim)
@@ -181,37 +229,72 @@ class GNNBranch(nn.Module):
     def forward(self, data):
         """
         Args:
-            data: PyG Batch object
+            data: PyG Batch object s heterogenními atributy
         
         Returns:
-            graph_embedding: [batch_size, hidden_dim]
+            graph_embedding: [batch_size, 2*hidden_dim]
         """
-        x, edge_index, edge_attr, batch = \
-            data.x, data.edge_index, data.edge_attr, data.batch
+        x = data.x
+        edge_index = data.edge_index
+        batch = data.batch
         
-        # Input projection
-        x = self.input_projection(x)
+        # Získej node_type (pokud neexistuje → všechno protein)
+        node_type = getattr(data, 'node_type', None)
+        edge_type = getattr(data, 'edge_type', None)
         
-        # GNN propagation
+        if node_type is None:
+            node_type = torch.zeros(x.size(0), dtype=torch.long, 
+                                    device=x.device)
+        
+        # ---- Separate input projection ----
+        protein_mask = (node_type == 0)
+        ligand_mask = (node_type == 1)
+        
+        # Projektuj protein a ligand uzly zvlášť
+        h = torch.zeros(x.size(0), self.hidden_dim, device=x.device)
+        
+        if protein_mask.any():
+            # Protein uzly: vezmi jen prvních protein_dim features
+            prot_x = x[protein_mask, :self.node_dim]
+            h[protein_mask] = self.protein_projection(prot_x)
+        
+        if ligand_mask.any():
+            # Ligand uzly: vezmi jen prvních ligand_dim features
+            lig_x = x[ligand_mask, :self.ligand_dim]
+            h[ligand_mask] = self.ligand_projection(lig_x)
+        
+        # ---- Přidej node type embedding ----
+        h = h + self.node_type_embedding(node_type)
+        
+        # ---- GNN propagation ----
         for i, (gnn, norm) in enumerate(zip(self.gnn_layers, self.norms)):
             if self.use_gat:
-                x_new = gnn(x, edge_index)
+                x_new = gnn(h, edge_index)
             else:
-                x_new = gnn(x, edge_index, edge_attr)
+                x_new = gnn(h, edge_index)
             
             if i > 0:
-                x_new = x_new + x  # residual
+                x_new = x_new + h  # residual
             
-            x = norm(x_new)
-            x = F.relu(x)
-            x = self.dropout(x)
+            h = norm(x_new)
+            h = F.relu(h)
+            h = self.dropout(h)
         
-        M = x  # final node embeddings
+        # M: final node embeddings [total_nodes, hidden_dim]
+        M = h
         
-        # Self-attention pooling
+        # ---- Attention pooling POUZE přes protein uzly ----
+        # Ligand uzly ovlivnily protein embeddingy přes message passing,
+        # ale finální embedding grafu je agregace proteinových uzlů.
+        
+        # Maskuj ligand uzly pro pooling: nastavíme jim -inf attention
         attention_input = self.W1(M)
         attention_scores = self.W2(torch.tanh(attention_input))
-        attention_weights = self._batch_softmax(attention_scores, batch)
+        
+        # Protein-only softmax: ligand uzly dostanou score -inf
+        attention_weights = self._batch_softmax_masked(
+            attention_scores, batch, protein_mask
+        )
         
         pooled_per_head = []
         for head in range(self.num_heads):
@@ -222,25 +305,40 @@ class GNNBranch(nn.Module):
         
         attention_pooled = torch.stack(pooled_per_head).mean(dim=0)
         
-        # Global pooling
-        global_pooled = global_mean_pool(M, batch)
+        # Global pooling (jen protein)
+        M_protein = M.clone()
+        M_protein[ligand_mask] = 0.0
+        global_pooled = global_mean_pool(M_protein, batch)
         
-        # Concatenate → project back to hidden_dim
         combined = torch.cat([attention_pooled, global_pooled], dim=1)
         
         return combined  # [batch_size, 2 * hidden_dim]
     
-    def _batch_softmax(self, scores, batch):
+    def _batch_softmax_masked(self, scores, batch, protein_mask):
+        """
+        Softmax per graph, ale POUZE přes protein uzly.
+        Ligand uzly dostanou weight = 0.
+        """
         batch_size = batch.max().item() + 1
         num_heads = scores.size(1)
         weights = torch.zeros_like(scores)
         
         for i in range(batch_size):
-            mask = (batch == i)
+            graph_mask = (batch == i)
+            prot_in_graph = graph_mask & protein_mask
+            
+            if not prot_in_graph.any():
+                # Fallback: všechny uzly (nemá protein?)
+                for head in range(num_heads):
+                    graph_scores = scores[graph_mask, head]
+                    weights[graph_mask, head] = F.softmax(graph_scores, dim=0)
+                continue
+            
             for head in range(num_heads):
-                graph_scores = scores[mask, head]
-                graph_weights = F.softmax(graph_scores, dim=0)
-                weights[mask, head] = graph_weights
+                prot_scores = scores[prot_in_graph, head]
+                prot_weights = F.softmax(prot_scores, dim=0)
+                weights[prot_in_graph, head] = prot_weights
+                # Ligand uzly zůstanou na 0
         
         return weights
 
@@ -267,6 +365,7 @@ class DualBranchPredictor(nn.Module):
                  esm_dim=1280,
                  # GNN branch params
                  node_dim=1310,
+                 ligand_dim=None,  # None → LigandFeatures.LIGAND_FEAT_DIM (36)
                  # Shared params
                  hidden_dim=256,
                  num_gnn_layers=3,
@@ -284,7 +383,8 @@ class DualBranchPredictor(nn.Module):
             num_gnn_layers=num_gnn_layers,
             num_attention_heads=num_attention_heads,
             dropout=dropout,
-            use_gat=use_gat
+            use_gat=use_gat,
+            ligand_dim=ligand_dim
         )
         # GNN branch outputs 2*hidden_dim, project to hidden_dim
         self.gnn_proj = nn.Sequential(
@@ -392,6 +492,7 @@ if __name__ == '__main__':
     model = DualBranchPredictor(
         esm_dim=1280,
         node_dim=1310,
+        ligand_dim=36,  # LigandFeatures.LIGAND_FEAT_DIM
         hidden_dim=256,
         num_gnn_layers=3,
         num_attention_heads=4,

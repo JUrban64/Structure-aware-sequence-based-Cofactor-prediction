@@ -1,5 +1,128 @@
 import numpy as np
 
+# ============================================================
+# Konfigurace pro ligandové features
+# ============================================================
+
+# Prvky běžné v kofaktorech (pro one-hot encoding)
+LIGAND_ELEMENTS = ['C', 'N', 'O', 'P', 'S']  # 5D one-hot
+
+# Funkční skupiny kofaktorů (pro one-hot encoding)
+FUNCTIONAL_GROUPS = [
+    'adenine', 'nicotinamide', 'isoalloxazine',
+    'ribose', 'ribose_A', 'ribose_N', 'ribitol',
+    'phosphate', 'alpha_P', 'beta_P', 'gamma_P',
+    'pantothenate', 'cysteamine',
+    'unknown'
+]  # 14D one-hot
+
+# Známé kofaktory (pro cofactor_id one-hot)
+KNOWN_COFACTORS = ['NAD', 'NADP', 'FAD', 'FMN', 'ATP', 'ADP',
+                   'AMP', 'GTP', 'GDP', 'COA', 'SAM', 'THF',
+                   'PLP', 'TPP', 'HEM']  # 15 kofaktorů
+
+COFACTOR_TO_IDX = {c: i for i, c in enumerate(KNOWN_COFACTORS)}
+
+
+class LigandFeatures:
+    """
+    Feature extraction pro ligandové atomy/uzly v grafu.
+    
+    Každý ligandový atom dostane feature vektor:
+        - element one-hot  [5]  (C, N, O, P, S)
+        - functional_group one-hot [14] (adenine, ribose, phosphate, ...)
+        - is_aromatic [1]  (odhad z funkční skupiny)
+        - n_bonds [1]  (počet vazeb, normalizováno)
+        - cofactor_id one-hot [15]  (NAD, FAD, ATP, ...)
+        ─────────────────────────────────────────
+        Total: 36D na ligandový atom
+    
+    Dim je záměrně nízký — ligandové uzly se poté projektují
+    na hidden_dim stejně jako proteinové.
+    """
+    
+    LIGAND_FEAT_DIM = 36  # 5 + 14 + 1 + 1 + 15
+    
+    # Aromatické funkční skupiny
+    AROMATIC_FGS = {'adenine', 'nicotinamide', 'isoalloxazine'}
+    
+    def __init__(self):
+        self.element_to_idx = {e: i for i, e in enumerate(LIGAND_ELEMENTS)}
+        self.fg_to_idx = {fg: i for i, fg in enumerate(FUNCTIONAL_GROUPS)}
+    
+    def get_atom_features(self, ligand_atoms, ligand_bonds, cofactor_name):
+        """
+        Vytvoří feature matici pro všechny atomy ligandu.
+        
+        Args:
+            ligand_atoms: list of dicts from BindingSiteExtractor._extract_ligand_atoms()
+            ligand_bonds: list of (i, j, dist) from _compute_ligand_bonds()
+            cofactor_name: str, e.g. 'NAD', 'FAD'
+        
+        Returns:
+            features: np.array [n_lig_atoms, 36]
+        """
+        if len(ligand_atoms) == 0:
+            return np.zeros((0, self.LIGAND_FEAT_DIM))
+        
+        # Spočítej počet vazeb pro každý atom
+        bond_counts = np.zeros(len(ligand_atoms))
+        for i, j, _ in ligand_bonds:
+            bond_counts[i] += 1
+            bond_counts[j] += 1
+        max_bonds = max(bond_counts.max(), 1)
+        
+        # Cofactor one-hot (sdílený pro všechny atomy)
+        cof_onehot = np.zeros(len(KNOWN_COFACTORS))
+        if cofactor_name in COFACTOR_TO_IDX:
+            cof_onehot[COFACTOR_TO_IDX[cofactor_name]] = 1.0
+        
+        features = []
+        for idx, atom in enumerate(ligand_atoms):
+            feat = []
+            
+            # 1) Element one-hot [5]
+            elem_oh = np.zeros(len(LIGAND_ELEMENTS))
+            eidx = self.element_to_idx.get(atom['element'], -1)
+            if eidx >= 0:
+                elem_oh[eidx] = 1.0
+            feat.append(elem_oh)
+            
+            # 2) Functional group one-hot [14]
+            fg_oh = np.zeros(len(FUNCTIONAL_GROUPS))
+            fg_name = atom.get('functional_group', 'unknown')
+            fidx = self.fg_to_idx.get(fg_name, self.fg_to_idx['unknown'])
+            fg_oh[fidx] = 1.0
+            feat.append(fg_oh)
+            
+            # 3) Is aromatic [1]
+            is_arom = np.array([1.0 if fg_name in self.AROMATIC_FGS else 0.0])
+            feat.append(is_arom)
+            
+            # 4) Normalized bond count [1]
+            n_bonds = np.array([bond_counts[idx] / max_bonds])
+            feat.append(n_bonds)
+            
+            # 5) Cofactor ID one-hot [15]
+            feat.append(cof_onehot)
+            
+            features.append(np.concatenate(feat))
+        
+        return np.array(features, dtype=np.float32)
+    
+    def get_cofactor_global_embedding(self, cofactor_name):
+        """
+        Vrátí globální vektor pro daný kofaktor (pro conditioning).
+        Použitelné v budoucnu pro multi-cofactor predikci.
+        
+        Returns:
+            embedding: np.array [15]
+        """
+        emb = np.zeros(len(KNOWN_COFACTORS))
+        if cofactor_name in COFACTOR_TO_IDX:
+            emb[COFACTOR_TO_IDX[cofactor_name]] = 1.0
+        return emb
+
 class AdditionalFeatures:
     """
     Extract BLOSUM, physicochemical, and positional features
@@ -93,81 +216,42 @@ class AdditionalFeatures:
         return np.array(features)
     
     def _load_blosum62(self):
-        """Load BLOSUM62 matrix"""
-        # Simplified version
+        """
+        Load BLOSUM62 matrix as per-AA row vectors.
+        Returns dict: AA → [20] scores against all 20 standard AAs.
+        Order: ARNDCQEGHILKMFPSTWYV
+        """
         aa_list = 'ARNDCQEGHILKMFPSTWYV'
-        blosum62 = {
-    ('W', 'F'): 1, ('L', 'R'): -2, ('S', 'P'): -1, ('V', 'T'): 0,
-    ('Q', 'Q'): 5, ('N', 'A'): -2, ('Z', 'Y'): -2, ('W', 'R'): -3,
-    ('Q', 'A'): -1, ('S', 'D'): 0, ('H', 'H'): 8, ('S', 'H'): -1,
-    ('H', 'D'): -1, ('L', 'N'): -3, ('W', 'A'): -3, ('Y', 'M'): -1,
-    ('G', 'R'): -2, ('Y', 'I'): -1, ('Y', 'E'): -2, ('B', 'Y'): -3,
-    ('Y', 'A'): -2, ('V', 'D'): -3, ('B', 'S'): 0, ('Y', 'Y'): 7,
-    ('G', 'N'): 0, ('E', 'C'): -4, ('Y', 'Q'): -1, ('Z', 'Z'): 4,
-    ('V', 'A'): 0, ('C', 'C'): 9, ('M', 'R'): -1, ('V', 'E'): -2,
-    ('T', 'N'): 0, ('P', 'P'): 7, ('V', 'I'): 3, ('V', 'S'): -2,
-    ('Z', 'P'): -1, ('V', 'M'): 1, ('T', 'F'): -2, ('V', 'Q'): -2,
-    ('K', 'K'): 5, ('P', 'D'): -1, ('I', 'H'): -3, ('I', 'D'): -3,
-    ('T', 'R'): -1, ('P', 'L'): -3, ('K', 'G'): -2, ('M', 'N'): -2,
-    ('P', 'H'): -2, ('F', 'Q'): -3, ('Z', 'G'): -2, ('X', 'L'): -1,
-    ('T', 'M'): -1, ('Z', 'C'): -3, ('X', 'H'): -1, ('D', 'R'): -2,
-    ('B', 'W'): -4, ('X', 'D'): -1, ('Z', 'K'): 1, ('F', 'A'): -2,
-    ('Z', 'W'): -3, ('F', 'E'): -3, ('D', 'N'): 1, ('B', 'K'): 0,
-    ('X', 'X'): -1, ('F', 'I'): 0, ('B', 'G'): -1, ('X', 'T'): 0,
-    ('F', 'M'): 0, ('B', 'C'): -3, ('Z', 'I'): -3, ('Z', 'V'): -2,
-    ('S', 'S'): 4, ('L', 'Q'): -2, ('W', 'E'): -3, ('Q', 'R'): 1,
-    ('N', 'N'): 6, ('W', 'M'): -1, ('Q', 'C'): -3, ('W', 'I'): -3,
-    ('S', 'C'): -1, ('L', 'A'): -1, ('S', 'G'): 0, ('L', 'E'): -3,
-    ('W', 'Q'): -2, ('H', 'G'): -2, ('S', 'K'): 0, ('Q', 'N'): 0,
-    ('N', 'R'): 0, ('H', 'C'): -3, ('Y', 'N'): -2, ('G', 'Q'): -2,
-    ('Y', 'F'): 3, ('C', 'A'): 0, ('V', 'L'): 1, ('G', 'E'): -2,
-    ('G', 'A'): 0, ('K', 'R'): 2, ('E', 'D'): 2, ('Y', 'R'): -2,
-    ('M', 'Q'): 0, ('T', 'I'): -1, ('C', 'D'): -3, ('V', 'F'): -1,
-    ('T', 'A'): 0, ('T', 'P'): -1, ('B', 'P'): -2, ('T', 'E'): -1,
-    ('V', 'N'): -3, ('P', 'G'): -2, ('M', 'A'): -1, ('K', 'H'): -1,
-    ('V', 'R'): -3, ('P', 'C'): -3, ('M', 'E'): -2, ('K', 'L'): -2,
-    ('V', 'V'): 4, ('M', 'I'): 1, ('T', 'Q'): -1, ('I', 'G'): -4,
-    ('P', 'K'): -1, ('M', 'M'): 5, ('K', 'D'): -1, ('I', 'C'): -1,
-    ('Z', 'D'): 1, ('F', 'R'): -3, ('X', 'K'): -1, ('Q', 'D'): 0,
-    ('X', 'G'): -1, ('Z', 'L'): -3, ('X', 'C'): -2, ('Z', 'H'): 0,
-    ('B', 'L'): -4, ('B', 'H'): 0, ('F', 'F'): 6, ('X', 'W'): -2,
-    ('B', 'D'): 4, ('D', 'A'): -2, ('S', 'L'): -2, ('X', 'S'): 0,
-    ('F', 'N'): -3, ('S', 'R'): -1, ('W', 'D'): -4, ('V', 'Y'): -1,
-    ('W', 'L'): -2, ('H', 'R'): 0, ('W', 'H'): -2, ('H', 'N'): 1,
-    ('W', 'T'): -2, ('T', 'T'): 5, ('S', 'F'): -2, ('W', 'P'): -4,
-    ('L', 'D'): -4, ('B', 'I'): -3, ('L', 'H'): -3, ('S', 'N'): 1,
-    ('B', 'T'): -1, ('L', 'L'): 4, ('Y', 'K'): -2, ('E', 'Q'): 2,
-    ('Y', 'G'): -3, ('Z', 'S'): 0, ('Y', 'C'): -2, ('G', 'D'): -1,
-    ('B', 'V'): -3, ('E', 'A'): -1, ('Y', 'W'): 2, ('E', 'E'): 5,
-    ('Y', 'S'): -2, ('C', 'N'): -3, ('V', 'C'): -1, ('T', 'H'): -2,
-    ('P', 'R'): -2, ('V', 'G'): -3, ('T', 'L'): -1, ('V', 'K'): -2,
-    ('K', 'Q'): 1, ('R', 'A'): -1, ('I', 'R'): -3, ('T', 'D'): -1,
-    ('P', 'F'): -4, ('I', 'N'): -3, ('K', 'I'): -3, ('M', 'D'): -3,
-    ('V', 'W'): -3, ('W', 'W'): 11, ('M', 'H'): -2, ('P', 'N'): -2,
-    ('K', 'A'): -1, ('M', 'L'): 2, ('K', 'E'): 1, ('Z', 'E'): 4,
-    ('X', 'N'): -1, ('Z', 'A'): -1, ('Z', 'M'): -1, ('X', 'F'): -1,
-    ('K', 'C'): -3, ('B', 'Q'): 0, ('X', 'B'): -1, ('B', 'M'): -3,
-    ('F', 'C'): -2, ('Z', 'Q'): 3, ('X', 'Z'): -1, ('F', 'G'): -3,
-    ('B', 'E'): 1, ('X', 'V'): -1, ('F', 'K'): -3, ('B', 'A'): -2,
-    ('X', 'R'): -1, ('D', 'D'): 6, ('W', 'G'): -2, ('Z', 'F'): -3,
-    ('S', 'Q'): 0, ('W', 'C'): -2, ('W', 'K'): -3, ('H', 'Q'): 0,
-    ('L', 'C'): -1, ('W', 'N'): -4, ('S', 'A'): 1, ('L', 'G'): -4,
-    ('W', 'S'): -3, ('S', 'E'): 0, ('H', 'E'): 0, ('S', 'I'): -2,
-    ('H', 'A'): -2, ('S', 'M'): -1, ('Y', 'L'): -1, ('Y', 'H'): 2,
-    ('Y', 'D'): -3, ('E', 'R'): 0, ('X', 'P'): -2, ('G', 'G'): 6,
-    ('G', 'C'): -3, ('E', 'N'): 0, ('Y', 'T'): -2, ('Y', 'P'): -3,
-    ('T', 'K'): -1, ('A', 'A'): 4, ('P', 'Q'): -1, ('T', 'C'): -1,
-    ('V', 'H'): -3, ('T', 'G'): -2, ('I', 'Q'): -3, ('Z', 'T'): -1,
-    ('C', 'R'): -3, ('V', 'P'): -2, ('P', 'E'): -1, ('M', 'C'): -1,
-    ('K', 'N'): 0, ('I', 'I'): 4, ('P', 'A'): -1, ('M', 'G'): -3,
-    ('T', 'S'): 1, ('I', 'E'): -3, ('P', 'M'): -2, ('M', 'K'): -1,
-    ('I', 'A'): -1, ('P', 'I'): -3, ('R', 'R'): 5, ('X', 'M'): -1,
-    ('L', 'I'): 2, ('X', 'I'): -1, ('Z', 'B'): 1, ('X', 'E'): -1,
-    ('Z', 'N'): 0, ('X', 'A'): 0, ('B', 'R'): -1, ('B', 'N'): 3,
-    ('F', 'D'): -3, ('X', 'Y'): -1, ('Z', 'R'): 0, ('F', 'H'): -1,
-    ('B', 'F'): -3, ('F', 'L'): 0, ('X', 'Q'): -1, ('B', 'B'): 4
-}
-        # ... load actual BLOSUM62 values
+        # Full symmetric BLOSUM62 matrix (rows/cols in aa_list order)
+        # Reference: Henikoff & Henikoff (1992) PNAS 89:10915-10919
+        matrix = [
+            # A   R   N   D   C   Q   E   G   H   I   L   K   M   F   P   S   T   W   Y   V
+            [ 4, -1, -2, -2,  0, -1, -1,  0, -2, -1, -1, -1, -1, -2, -1,  1,  0, -3, -2,  0],  # A
+            [-1,  5,  0, -2, -3,  1,  0, -2,  0, -3, -2,  2, -1, -3, -2, -1, -1, -3, -2, -3],  # R
+            [-2,  0,  6,  1, -3,  0,  0,  0,  1, -3, -3,  0, -2, -3, -2,  1,  0, -4, -2, -3],  # N
+            [-2, -2,  1,  6, -3,  0,  2, -1, -1, -3, -4, -1, -3, -3, -1,  0, -1, -4, -3, -3],  # D
+            [ 0, -3, -3, -3,  9, -3, -4, -3, -3, -1, -1, -3, -1, -2, -3, -1, -1, -2, -2, -1],  # C
+            [-1,  1,  0,  0, -3,  5,  2, -2,  0, -3, -2,  1,  0, -3, -1,  0, -1, -2, -1, -2],  # Q
+            [-1,  0,  0,  2, -4,  2,  5, -2,  0, -3, -3,  1, -2, -3, -1,  0, -1, -3, -2, -2],  # E
+            [ 0, -2,  0, -1, -3, -2, -2,  6, -2, -4, -4, -2, -3, -3, -2,  0, -2, -2, -3, -3],  # G
+            [-2,  0,  1, -1, -3,  0,  0, -2,  8, -3, -3, -1, -2, -1, -2, -1, -2, -2,  2, -3],  # H
+            [-1, -3, -3, -3, -1, -3, -3, -4, -3,  4,  2, -3,  1,  0, -3, -2, -1, -3, -1,  3],  # I
+            [-1, -2, -3, -4, -1, -2, -3, -4, -3,  2,  4, -2,  2,  0, -3, -2, -1, -2, -1,  1],  # L
+            [-1,  2,  0, -1, -3,  1,  1, -2, -1, -3, -2,  5, -1, -3, -1,  0, -1, -3, -2, -2],  # K
+            [-1, -1, -2, -3, -1,  0, -2, -3, -2,  1,  2, -1,  5,  0, -2, -1, -1, -1, -1,  1],  # M
+            [-2, -3, -3, -3, -2, -3, -3, -3, -1,  0,  0, -3,  0,  6, -4, -2, -2,  1,  3, -1],  # F
+            [-1, -2, -2, -1, -3, -1, -1, -2, -2, -3, -3, -1, -2, -4,  7, -1, -1, -4, -3, -2],  # P
+            [ 1, -1,  1,  0, -1,  0,  0,  0, -1, -2, -2,  0, -1, -2, -1,  4,  1, -3, -2, -2],  # S
+            [ 0, -1,  0, -1, -1, -1, -1, -2, -2, -1, -1, -1, -1, -2, -1,  1,  5, -2, -2,  0],  # T
+            [-3, -3, -4, -4, -2, -2, -3, -2, -2, -3, -2, -3, -1,  1, -4, -3, -2, 11,  2, -3],  # W
+            [-2, -2, -2, -3, -2, -1, -2, -3,  2, -1, -1, -2, -1,  3, -3, -2, -2,  2,  7, -1],  # Y
+            [ 0, -3, -3, -3, -1, -2, -2, -3, -3,  3,  1, -2,  1, -1, -2, -2,  0, -3, -1,  4],  # V
+        ]
+        
+        blosum62 = {}
+        for i, aa in enumerate(aa_list):
+            blosum62[aa] = matrix[i]
+        
         return blosum62
 
 
@@ -175,10 +259,10 @@ class AdditionalFeatures:
 def create_node_features(bs_info, use_esm=True, use_blosum=True, 
                          use_physchem=True, use_position=True):
     """
-    Combine multiple feature types
+    Combine multiple feature types FOR PROTEIN NODES ONLY.
     
     Returns:
-        node_features: [n_bs, total_dim]
+        node_features: [n_bs, total_dim]  (protein_dim = 1310 default)
     """
     features = []
     
@@ -213,3 +297,24 @@ def create_node_features(bs_info, use_esm=True, use_blosum=True,
     node_features = np.concatenate(features, axis=1)
     
     return node_features
+
+
+def create_ligand_node_features(bs_info):
+    """
+    Feature extraction pro ligandové uzly.
+    
+    Args:
+        bs_info: dict z BindingSiteExtractor (musí obsahovat
+                 'ligand_atoms', 'ligand_bonds', 'ligand_name')
+    
+    Returns:
+        ligand_features: np.array [n_lig_atoms, 36]
+            (nebo [0, 36] pokud nejsou žádné ligandové atomy)
+    """
+    lig_feat = LigandFeatures()
+    
+    ligand_atoms = bs_info.get('ligand_atoms', [])
+    ligand_bonds = bs_info.get('ligand_bonds', [])
+    cofactor_name = bs_info.get('ligand_name', 'UNK')
+    
+    return lig_feat.get_atom_features(ligand_atoms, ligand_bonds, cofactor_name)

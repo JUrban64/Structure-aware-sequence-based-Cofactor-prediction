@@ -105,17 +105,14 @@ class ESMFeatureExtractor:
 
 
 # Použití
-esm_extractor = ESMFeatureExtractor()
+if __name__ == '__main__':
+    esm_extractor = ESMFeatureExtractor()
 
-
-
-# Pre-compute embeddings pro všechny binding sites
-for bs_info in binding_sites:
-    # Extract ESM embeddings
-    bs_embeddings = esm_extractor.extract_binding_site_embeddings(
-        bs_info['full_sequence'],
-        bs_info['binding_site_indices']
-    )
-    
-    bs_info['esm_embeddings'] = bs_embeddings
-    print(f"Extracted embeddings: {bs_embeddings.shape}")
+    # Pre-compute embeddings pro všechny binding sites
+    for bs_info in binding_sites:
+        bs_embeddings = esm_extractor.extract_binding_site_embeddings(
+            bs_info['full_sequence'],
+            bs_info['binding_site_indices']
+        )
+        bs_info['esm_embeddings'] = bs_embeddings
+        print(f"Extracted embeddings: {bs_embeddings.shape}")
