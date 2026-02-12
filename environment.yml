@@ -1,0 +1,31 @@
+name: sqbcp
+channels:
+  - pytorch
+  - pyg
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  # Core scientific
+  - numpy
+  - scipy
+  - scikit-learn
+
+  # PyTorch (CPU verze – pro GPU nahradit pytorch-cuda=12.1)
+  - pytorch
+  - torchvision
+  - torchaudio
+  - cpuonly              # ← smazat tento řádek a přidat pytorch-cuda=12.1 pro GPU
+
+  # PyTorch Geometric
+  - pyg::pyg
+
+  # Bioinformatics
+  - conda-forge::biopython
+
+  # pip-only packages
+  - pip
+  - pip:
+      - transformers      # HuggingFace (ESM-2 model)
+      - sentencepiece     # tokenizer backend pro transformers
