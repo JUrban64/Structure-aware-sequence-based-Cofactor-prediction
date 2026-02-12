@@ -1,10 +1,49 @@
 # SQBCP – Sequence & Structure Based Cofactor Binding Predictor
 
-GNN-based prediktor vazby NAD kofaktoru na proteinové binding site, využívající ESM-2 embeddingy a grafovou neuronovou síť (GAT/GCN).
+**Dual-branch** prediktor vazby NAD kofaktoru, využívající ESM-2 embeddingy, grafovou neuronovou síť (GAT/GCN) pro strukturní data a 1D-CNN+Attention větev pro sekvence bez struktury.
+
+> **Klíčová vlastnost:** Model se učí jak z PDB struktur (stovky), tak z anotovaných sekvencí bez struktury (tisíce z UniProt), čímž využívá mnohem více dat.
 
 ---
 
 ## Architektura & logika
+
+### Dual-branch architektura
+
+```
+                ┌─────────────────────────────────────────┐
+                │           VSTUPNÍ DATA                  │
+                │                                         │
+                │  PDB struktury        Sekvence (UniProt)│
+                │  (~500 s NAD)         (~10 000 s anotací)│
+                └────────┬─────────────────────┬──────────┘
+                         │                     │
+            ┌────────────▼──────────┐  ┌───────▼──────────────┐
+            │  GNN Branch           │  │ Sequence Branch      │
+            │  (binding_site_graph) │  │ (sequence_dataset)   │
+            │                       │  │                      │
+            │  PDB → Binding Site   │  │ Sekvence → ESM-2     │
+            │  → kontaktní mapa     │  │ embeddingy           │
+            │  → PyG graf           │  │ → 1D-CNN (local      │
+            │  → GAT/GCN vrstvy    │  │   motifs)            │
+            │  → Attn pooling       │  │ → Self-Attention     │
+            │                       │  │ → Learned pooling    │
+            │  [B, hidden_dim]      │  │ [B, hidden_dim]      │
+            └────────────┬──────────┘  └───────┬──────────────┘
+                         │                     │
+                         └──────────┬──────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │  Shared Classifier   │
+                         │  (sdílený MLP)       │
+                         │  → 2 třídy           │
+                         └──────────┬──────────┘
+                                    │
+                                    ▼
+                             P(binds NAD)
+```
+
+### Detail GNN Branch (strukturní data)
 
 ```
 PDB soubor
@@ -19,57 +58,56 @@ PDB soubor
 │  - vytvoří kontaktní mapu│
 │    (Cα-Cα < 8 Å)        │
 └──────────┬───────────────┘
-           │  binding site residues + kontaktní mapa
+           │
            ▼
 ┌──────────────────────────┐
-│  2. ESM-2 Feature Extr.  │  (esm2_feature_ex.py)
-│  - extrahuje per-residue │
-│    embeddingy z ESM-2    │
-│    (1280D na residue)    │
-│  - vybere jen binding    │
-│    site pozice           │
-└──────────┬───────────────┘
-           │  ESM embeddingy [n_bs, 1280]
-           ▼
-┌──────────────────────────┐
-│  3. Additional Features  │  (additional_features.py)
-│  - BLOSUM62 encoding     │  [n_bs, 20]
-│  - Physicochemical props │  [n_bs, 7]
-│    (hydrofobicita, objem,│
-│     polarita, pI, ...)   │
-│  - Relativní pozice      │  [n_bs, 3]
-│                          │
-│  Celkem: 1280+20+7+3    │
-│        = 1310D na uzel   │
-└──────────┬───────────────┘
-           │  node features [n_bs, 1310]
-           ▼
-┌──────────────────────────┐
-│  4. Graph Construction   │  (binding_site_graph.py)
-│  - uzly = binding site   │
-│    residues              │
-│  - hrany = kontaktní mapa│
-│    (Cα vzdálenost < 8 Å) │
-│  - → PyG Data objekt     │
-└──────────┬───────────────┘
-           │  PyG graf
-           ▼
-┌──────────────────────────┐
-│  5. GNN Predictor        │  (binding_site_predictor.py)
-│  - Input projection      │
-│    (1310D → 256D)        │
-│  - 3× GAT/GCN vrstvy    │
-│    s residual connections│
-│  - Multi-head attention  │
-│    pooling (4 heads)     │
-│  - Global mean pooling   │
-│  - Classifier MLP        │
-│    → 2 třídy (binds/not) │
+│  2. ESM-2 + Features     │  (esm2_feature_ex.py + additional_features.py)
+│  ESM-2 embeddingy [1280] │
+│  + BLOSUM62 [20]         │
+│  + Physicochemical [7]   │
+│  + Position [3]          │
+│  = 1310D na uzel         │
 └──────────┬───────────────┘
            │
            ▼
-      P(binds NAD)
+┌──────────────────────────┐
+│  3. GNN (GAT/GCN)        │  (dual_predictor.py → GNNBranch)
+│  - 3× GAT vrstvy        │
+│  - Attention pooling     │
+│  → graph embedding [256] │
+└──────────────────────────┘
 ```
+
+### Detail Sequence Branch (sekvence bez struktury)
+
+```
+Sekvence (string)
+    │
+    ▼
+┌──────────────────────────┐
+│  1. ESM-2 Embeddings     │  (esm2_feature_ex.py)
+│  → per-residue [L, 1280] │
+└──────────┬───────────────┘
+           │
+           ▼
+┌──────────────────────────┐
+│  2. Sequence Branch      │  (dual_predictor.py → SequenceBranch)
+│  - Input projection      │
+│  - 3× 1D-CNN (lokální    │
+│    motivy, kernel=5)     │
+│  - Self-Attention        │
+│  - Learned pooling       │
+│  → seq embedding [256]   │
+└──────────────────────────┘
+```
+
+### Trénovací režimy
+
+| Režim | Vstup | Větev | Kdy použít |
+|-------|-------|-------|------------|
+| `sequence` | Sekvence (ESM emb.) | Seq branch + classifier | Sekvence bez struktury |
+| `structure` | PyG graf | GNN branch + classifier | PDB data se strukturou |
+| `both` | Oboje | Obě + fusion + consistency | PDB data (obě větve) |
 
 ### Proč tento přístup?
 
@@ -77,6 +115,9 @@ PDB soubor
 2. **Grafová reprezentace** – binding site je přirozeně graf (residues = uzly, prostorové kontakty = hrany), GNN propaguje informaci po struktuře
 3. **GAT (Graph Attention)** – učí se, které kontakty jsou důležitější pro predikci, vhodné pro malé grafy (15–30 uzlů)
 4. **Multi-head attention pooling** – agreguje uzlové embeddingy do jednoho grafového vektoru s naučenými vahami
+5. **Dual-branch** – využívá mnohem více sekvenčních dat (tisíce z UniProt) vedle stovek PDB struktur
+6. **Sdílený classifier** – obě větve sdílejí klasifikační hlavu → sekvenční data pomáhají i GNN větvi
+7. **Consistency loss** – na PDB datech penalizuje rozdíl mezi GNN a Seq embeddingy → Seq branch se učí aproximovat strukturní informaci
 
 ---
 
@@ -192,7 +233,7 @@ print(f"Grafů: {len(dataset)}")
 print(f"Node features dim: {dataset[0].x.shape[1]}")
 ```
 
-### Krok 4: Trénink modelu
+### Krok 4a: Trénink (jen PDB struktury – původní pipeline)
 
 ```python
 import torch
@@ -201,31 +242,66 @@ from train import Trainer
 from torch_geometric.loader import DataLoader
 from sklearn.model_selection import train_test_split
 
-# Inicializace modelu
-model = BindingSiteNADPredictor(
-    node_dim=1310,           # musí odpovídat feature_config
-    hidden_dim=256,
-    num_gnn_layers=3,
-    num_attention_heads=4,
-    dropout=0.5,
-    use_gat=True             # True = GAT, False = GCN
-)
-
-# Split dat
-train_graphs, val_graphs = train_test_split(
-    dataset.graphs, test_size=0.2, random_state=42
-)
-
+model = BindingSiteNADPredictor(node_dim=1310, use_gat=True)
+train_graphs, val_graphs = train_test_split(dataset.graphs, test_size=0.2)
 train_loader = DataLoader(train_graphs, batch_size=32, shuffle=True)
 val_loader = DataLoader(val_graphs, batch_size=32)
 
-# Trénink
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-trainer = Trainer(model, train_loader, val_loader, device=device)
+trainer = Trainer(model, train_loader, val_loader, device='cpu')
 trainer.train(num_epochs=100)
 ```
 
-Nejlepší model se automaticky uloží jako `best_model.pth`.
+### Krok 4b: Dual trénink (PDB + sekvence – doporučeno) 🆕
+
+Využívá mnohem více dat – sekvence z UniProt bez nutnosti 3D struktury:
+
+```python
+import torch
+from dual_predictor import DualBranchPredictor
+from dual_train import DualTrainer
+from sequence_dataset import SequenceDataset, collate_sequences, load_sequences_from_csv
+from torch.utils.data import DataLoader
+from torch_geometric.loader import DataLoader as PyGDataLoader
+from sklearn.model_selection import train_test_split
+
+# 1. Strukturní data (PDB) – stávající pipeline
+train_graphs, val_graphs = train_test_split(dataset.graphs, test_size=0.2)
+graph_train_loader = PyGDataLoader(train_graphs, batch_size=32, shuffle=True)
+graph_val_loader = PyGDataLoader(val_graphs, batch_size=32)
+
+# 2. Sekvenční data (UniProt) – NOVÝ zdroj dat
+sequences, labels = load_sequences_from_csv('data/nad_sequences.csv')
+seq_dataset = SequenceDataset(sequences, labels, esm_extractor=esm)
+seq_train, seq_val = train_test_split(list(range(len(seq_dataset))), test_size=0.2)
+seq_train_loader = DataLoader(
+    torch.utils.data.Subset(seq_dataset, seq_train),
+    batch_size=16, shuffle=True, collate_fn=collate_sequences
+)
+seq_val_loader = DataLoader(
+    torch.utils.data.Subset(seq_dataset, seq_val),
+    batch_size=16, collate_fn=collate_sequences
+)
+
+# 3. Dual-branch model
+model = DualBranchPredictor(
+    esm_dim=1280, node_dim=1310, hidden_dim=256,
+    num_gnn_layers=3, use_gat=True
+)
+
+# 4. Dual trainer
+trainer = DualTrainer(
+    model=model,
+    graph_train_loader=graph_train_loader,
+    graph_val_loader=graph_val_loader,
+    seq_train_loader=seq_train_loader,
+    seq_val_loader=seq_val_loader,
+    device='cuda' if torch.cuda.is_available() else 'cpu',
+    consistency_weight=0.3,
+)
+trainer.train(num_epochs=100)
+```
+
+Nejlepší model se automaticky uloží jako `best_dual_model.pth`.
 
 **Výstup tréninku:**
 ```
@@ -278,7 +354,36 @@ with torch.no_grad():
 print(f"P(binds NAD) = {prob:.4f}")
 ```
 
-### B) Jen ze sekvence (bez struktury)
+### B) Jen ze sekvence – Dual model (doporučeno) 🆕
+
+```python
+from dual_predictor import DualBranchPredictor
+from esm2_feature_ex import ESMFeatureExtractor
+import torch
+import torch.nn.functional as F
+
+# Načíst dual model
+model = DualBranchPredictor(esm_dim=1280, node_dim=1310, use_gat=True)
+model.load_state_dict(torch.load('best_dual_model.pth'))
+model.eval()
+
+# ESM embeddings
+esm = ESMFeatureExtractor()
+sequence = "MKVLITGAGSGIGKAIA..."
+emb = esm.extract_embeddings(sequence)  # [L, 1280]
+
+# Predikce (sequence-only mode)
+with torch.no_grad():
+    esm_tensor = torch.FloatTensor(emb).unsqueeze(0)  # [1, L, 1280]
+    logits, _ = model(mode='sequence', esm_embeddings=esm_tensor)
+    prob = F.softmax(logits, dim=1)[0, 1].item()
+
+print(f"P(binds NAD) = {prob:.4f}")
+```
+
+> **Výhoda dual modelu:** Nevyžaduje kontaktní mapu ani 3D strukturu. Seq branch se učil na tisících sekvencí → přesnější než starý `seq_only_predictor.py`.
+
+### C) Jen ze sekvence – starý přístup (vyžaduje contact predictor)
 
 ```python
 from seq_only_predictor import SequenceOnlyPredictor
@@ -290,27 +395,35 @@ prob = predictor.predict(sequence)
 print(f"P(binds NAD) = {prob:.4f}")
 ```
 
-> **Poznámka:** Sequence-only režim vyžaduje contact predictor pro odhad kontaktní mapy. Přesnost bude nižší než při použití skutečné struktury.
+> **Poznámka:** Starší přístup – vyžaduje contact predictor pro odhad kontaktní mapy.
 
 ---
 
 ## Struktura projektu
 
 ```
-ver2/
 ├── environment.yml           # Conda environment
 ├── README.md                 # Tento soubor
 │
+│── # Data pipeline
 ├── Binding_site_ex.py        # Extrakce binding site z PDB
 ├── esm2_feature_ex.py        # ESM-2 protein embeddingy
 ├── additional_features.py    # BLOSUM, physicochemical, pozice
 ├── binding_site_graph.py     # Konstrukce PyG grafů
-├── binding_site_predictor.py # GNN model (GAT/GCN)
-├── train.py                  # Tréninková smyčka
-├── seq_only_predictor.py     # Predikce jen ze sekvence
+├── sequence_dataset.py       # 🆕 Dataset pro sekvence bez struktury
+│
+│── # Modely
+├── binding_site_predictor.py # GNN-only model (GAT/GCN)
+├── dual_predictor.py         # 🆕 Dual-branch model (GNN + Seq)
+├── seq_only_predictor.py     # Starší seq-only inference wrapper
+│
+│── # Trénink
+├── train.py                  # Tréninková smyčka (GNN-only)
+├── dual_train.py             # 🆕 Dual training (PDB + sekvence)
 │
 ├── *.pdb                     # PDB vstupní soubory
-└── best_model.pth            # Uložený natrénovaný model
+├── best_model.pth            # Uložený GNN-only model
+└── best_dual_model.pth       # 🆕 Uložený dual model
 ```
 
 ## Důležité poznámky
