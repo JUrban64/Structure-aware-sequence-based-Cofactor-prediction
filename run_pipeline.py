@@ -42,10 +42,12 @@ from sklearn.model_selection import train_test_split
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_CONFIG = {
-    # Cesty
-    'pdb_positive_dir': os.path.join(BASE_DIR, 'data', 'pdb_positive'),
-    'pdb_negative_dir': os.path.join(BASE_DIR, 'data', 'pdb_negative'),
-    'seq_csv': os.path.join(BASE_DIR, 'data', 'sequences', 'nad_sequences.csv'),
+    # Cesty (dynamicky sestaveny v main() podle ligandu)
+    'data_root': os.path.join(BASE_DIR, 'data'),
+    'pdb_positive_dir': os.path.join(BASE_DIR, 'data', 'NAD', 'PDB', 'positive', 'vycisteno_protonated'),
+    'pdb_negative_dir': os.path.join(BASE_DIR, 'data', 'NAD', 'PDB', 'negative'),
+    'seq_positive_csv': os.path.join(BASE_DIR, 'data', 'NAD', 'sequences', 'positive', 'NAD_only_dataset.csv'),
+    'seq_negative_csv': os.path.join(BASE_DIR, 'data', 'NAD', 'sequences', 'negative', 'NO_cofa_15000_id0.csv'),
     'cache_dir': os.path.join(BASE_DIR, 'cache'),
     
     # Ligand
@@ -84,8 +86,6 @@ def parse_args():
                         help='Složka s PDB soubory (pozitivní)')
     parser.add_argument('--pdb-neg-dir', type=str, default=None,
                         help='Složka s PDB soubory (negativní)')
-    parser.add_argument('--seq-csv', type=str, default=None,
-                        help='CSV se sekvencemi')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=0.001)
@@ -221,27 +221,39 @@ def build_graph_dataset(binding_sites, include_ligand=True):
 # ============================================================
 # KROK 4: Sekvenční dataset
 # ============================================================
-def load_sequence_data(csv_path, esm_model_name, cache_dir):
-    """Načte a připraví sekvenční dataset."""
+def load_sequence_data(config):
+    """Načte a připraví sekvenční dataset z positive + negative CSV."""
     from sequence_dataset import (
-        SequenceDataset, load_sequences_from_csv, 
+        SequenceDataset, load_sequences_from_separate_csvs, 
         save_embeddings, load_embeddings
     )
     from esm2_feature_ex import ESMFeatureExtractor
     
-    if not os.path.exists(csv_path):
-        print(f"  ⚠ CSV soubor nenalezen: {csv_path}")
-        print("    Spusťte nejdřív: python download_data.py")
+    pos_csv = config['seq_positive_csv']
+    neg_csv = config['seq_negative_csv']
+    esm_model_name = config['esm_model']
+    cache_dir = config['cache_dir']
+    ligand = config['ligand_name']
+    
+    if not os.path.exists(pos_csv) and not os.path.exists(neg_csv):
+        print(f"  ⚠ Žádné CSV soubory nenalezeny:")
+        print(f"    Positive: {pos_csv}")
+        print(f"    Negative: {neg_csv}")
         return None
     
-    sequences, labels = load_sequences_from_csv(csv_path)
+    sequences, labels = load_sequences_from_separate_csvs(
+        pos_csv, neg_csv, 
+        cofactor_filter=ligand,
+        max_negative=None  # použít všechny
+    )
     
     if len(sequences) == 0:
         print("  ⚠ Žádné sekvence nenačteny")
         return None
     
     # Zkus načíst precomputed embeddingy
-    emb_cache = os.path.join(cache_dir, 'seq_embeddings.npz')
+    os.makedirs(cache_dir, exist_ok=True)
+    emb_cache = os.path.join(cache_dir, f'seq_embeddings_{ligand}.npz')
     precomputed = None
     if os.path.exists(emb_cache):
         print("  Načítám seq embeddingy z cache...")
@@ -408,9 +420,11 @@ def run_test(config):
     print("=" * 60)
     
     # Najdi PDB soubor
-    pdb_files = glob.glob(os.path.join(BASE_DIR, '*.pdb'))
+    pdb_files = glob.glob(os.path.join(config.get('pdb_positive_dir', ''), '*.pdb'))
     if not pdb_files:
-        pdb_files = glob.glob(os.path.join(BASE_DIR, 'data', 'pdb_positive', '*.pdb'))
+        pdb_files = glob.glob(os.path.join(BASE_DIR, '*.pdb'))
+    if not pdb_files:
+        pdb_files = glob.glob(os.path.join(BASE_DIR, 'data', '*', 'PDB', 'positive', '**', '*.pdb'), recursive=True)
     
     if not pdb_files:
         print("❌ Žádný PDB soubor nenalezen!")
@@ -469,6 +483,50 @@ def run_test(config):
 # ============================================================
 # MAIN
 # ============================================================
+def _setup_cofactor_paths(config):
+    """Nastaví cesty podle zvoleného kofaktoru a datové struktury."""
+    ligand = config['ligand_name']
+    data_root = config['data_root']
+    cofactor_dir = os.path.join(data_root, ligand)
+    
+    if not os.path.isdir(cofactor_dir):
+        print(f"  ⚠ Složka {cofactor_dir} neexistuje, zkouším alternativní cesty...")
+        return config
+    
+    # PDB cesty
+    pdb_base = os.path.join(cofactor_dir, 'PDB')
+    pos_pdb = os.path.join(pdb_base, 'positive')
+    
+    # Podpora pro podsložky (vycisteno_protonated apod.)
+    protonated = os.path.join(pos_pdb, 'vycisteno_protonated')
+    if os.path.isdir(protonated) and glob.glob(os.path.join(protonated, '*.pdb')):
+        config['pdb_positive_dir'] = protonated
+    elif os.path.isdir(pos_pdb) and glob.glob(os.path.join(pos_pdb, '*.pdb')):
+        config['pdb_positive_dir'] = pos_pdb
+    
+    config['pdb_negative_dir'] = os.path.join(pdb_base, 'negative')
+    
+    # Sekvenční cesty – hledej CSV soubory
+    seq_base = os.path.join(cofactor_dir, 'sequences')
+    pos_seq_dir = os.path.join(seq_base, 'positive')
+    neg_seq_dir = os.path.join(seq_base, 'negative')
+    
+    if os.path.isdir(pos_seq_dir):
+        csvs = glob.glob(os.path.join(pos_seq_dir, '*.csv'))
+        if csvs:
+            config['seq_positive_csv'] = csvs[0]
+    
+    if os.path.isdir(neg_seq_dir):
+        csvs = glob.glob(os.path.join(neg_seq_dir, '*.csv'))
+        if csvs:
+            config['seq_negative_csv'] = csvs[0]
+    
+    # Cache per cofactor
+    config['cache_dir'] = os.path.join(data_root, '..', 'cache', ligand)
+    
+    return config
+
+
 def main():
     args = parse_args()
     config = DEFAULT_CONFIG.copy()
@@ -478,13 +536,15 @@ def main():
         config['pdb_positive_dir'] = args.pdb_dir
     if args.pdb_neg_dir:
         config['pdb_negative_dir'] = args.pdb_neg_dir
-    if args.seq_csv:
-        config['seq_csv'] = args.seq_csv
     config['num_epochs'] = args.epochs
     config['batch_size_graph'] = args.batch_size
     config['lr'] = args.lr
     config['ligand_name'] = args.ligand
     config['esm_model'] = args.esm_model
+    
+    # Nastav cesty dynamicky podle kofaktoru
+    if not args.pdb_dir:  # Pokud uživatel nezadal explicitní cestu
+        config = _setup_cofactor_paths(config)
     
     # Quick test
     if args.test:
@@ -496,6 +556,10 @@ def main():
     print("=" * 60)
     print(f"Device: {config['device']}")
     print(f"Ligand: {config['ligand_name']}")
+    print(f"PDB positive: {config['pdb_positive_dir']}")
+    print(f"PDB negative: {config['pdb_negative_dir']}")
+    print(f"Seq positive: {config.get('seq_positive_csv', 'N/A')}")
+    print(f"Seq negative: {config.get('seq_negative_csv', 'N/A')}")
     
     # ---- KROK 1: Extrakce binding sites ----
     print(f"\n{'='*60}")
@@ -504,69 +568,73 @@ def main():
     
     binding_sites = []
     
-    # Pozitivní (s NAD)
+    # Pozitivní (s kofaktorem)
     if os.path.exists(config['pdb_positive_dir']):
-        print(f"\nPozitivní příklady (s {config['ligand_name']}):")
-        pos_sites = extract_binding_sites(
-            config['pdb_positive_dir'],
-            config['ligand_name'],
-            config['distance_threshold'],
-            label=1
-        )
-        binding_sites.extend(pos_sites)
+        pdb_count = len(glob.glob(os.path.join(config['pdb_positive_dir'], '*.pdb')))
+        if pdb_count > 0:
+            print(f"\nPozitivní příklady (s {config['ligand_name']}):")
+            pos_sites = extract_binding_sites(
+                config['pdb_positive_dir'],
+                config['ligand_name'],
+                config['distance_threshold'],
+                label=1
+            )
+            binding_sites.extend(pos_sites)
+        else:
+            print(f"\n  ⚠ Žádné PDB soubory v {config['pdb_positive_dir']}")
+    else:
+        print(f"\n  ⚠ Složka neexistuje: {config['pdb_positive_dir']}")
     
-    # Negativní (bez NAD) – hledáme jiný ligand nebo žádný
-    if os.path.exists(config['pdb_negative_dir']):
-        print(f"\nNegativní příklady (bez {config['ligand_name']}):")
-        neg_pdb_files = glob.glob(
-            os.path.join(config['pdb_negative_dir'], '*.pdb')
-        )
-        # Pro negativní: předstíráme binding site = prvních 20 residues
-        from Binding_site_ex import BindingSiteExtractor
-        ext = BindingSiteExtractor(distance_threshold=config['distance_threshold'])
-        
-        neg_count = 0
-        for pdb_file in neg_pdb_files:
-            try:
-                # Zkus najít binding site s jiným ligandem, nebo vezmi
-                # náhodnou oblast
-                structure = ext.parser.get_structure('prot', pdb_file)
-                model = structure[0]
-                chain = next(iter(model))
-                seq = ext._get_sequence(chain)
-                
-                if len(seq) < 20:
-                    continue
-                
-                # "Fake" binding site = centrální oblast sekvence
-                center = len(seq) // 2
-                bs_indices = list(range(max(0, center-10), min(len(seq), center+10)))
-                bs_sequence = ''.join([seq[i] for i in bs_indices])
-                
-                # Kontaktní mapa z náhodné oblasti
-                n = len(bs_indices)
-                contact = np.eye(n)
-                for k in range(n-1):
-                    contact[k, k+1] = 1.0
-                    contact[k+1, k] = 1.0
-                
-                bs_info = {
-                    'full_sequence': seq,
-                    'binding_site_sequence': bs_sequence,
-                    'binding_site_indices': bs_indices,
-                    'binding_site_residues': [],
-                    'contact_map': contact,
-                    'n_binding_site': n,
-                    'ligand_name': 'NONE',
-                    'pdb_file': pdb_file,
-                    'label': 0
-                }
-                binding_sites.append(bs_info)
-                neg_count += 1
-            except Exception:
-                pass
-        
-        print(f"  ✓ {neg_count} negativních příkladů")
+    # Negativní (bez kofaktoru)
+    neg_dir = config['pdb_negative_dir']
+    if os.path.exists(neg_dir):
+        neg_pdb_files = glob.glob(os.path.join(neg_dir, '*.pdb'))
+        if neg_pdb_files:
+            print(f"\nNegativní příklady (bez {config['ligand_name']}):")
+            # Pro negativní: fake binding site = centrální oblast sekvence
+            from Binding_site_ex import BindingSiteExtractor
+            ext = BindingSiteExtractor(distance_threshold=config['distance_threshold'])
+            
+            neg_count = 0
+            for pdb_file in neg_pdb_files:
+                try:
+                    structure = ext.parser.get_structure('prot', pdb_file)
+                    model_s = structure[0]
+                    chain = next(iter(model_s))
+                    seq = ext._get_sequence(chain)
+                    
+                    if len(seq) < 20:
+                        continue
+                    
+                    center = len(seq) // 2
+                    bs_indices = list(range(max(0, center-10), min(len(seq), center+10)))
+                    bs_sequence = ''.join([seq[i] for i in bs_indices])
+                    
+                    n = len(bs_indices)
+                    contact = np.eye(n)
+                    for k in range(n-1):
+                        contact[k, k+1] = 1.0
+                        contact[k+1, k] = 1.0
+                    
+                    bs_info = {
+                        'full_sequence': seq,
+                        'binding_site_sequence': bs_sequence,
+                        'binding_site_indices': bs_indices,
+                        'binding_site_residues': [],
+                        'contact_map': contact,
+                        'n_binding_site': n,
+                        'ligand_name': 'NONE',
+                        'pdb_file': pdb_file,
+                        'label': 0
+                    }
+                    binding_sites.append(bs_info)
+                    neg_count += 1
+                except Exception:
+                    pass
+            
+            print(f"  ✓ {neg_count} negativních příkladů")
+        else:
+            print(f"\n  ℹ Složka {neg_dir} je prázdná – pokračuji bez negativních PDB")
     
     # Fallback: zkus PDB soubory v root složce
     if len(binding_sites) == 0:
@@ -580,9 +648,8 @@ def main():
             binding_sites.extend(pos_sites)
     
     if len(binding_sites) == 0:
-        print("\n❌ Žádné binding sites! Spusťte nejdřív:")
-        print("   python download_data.py")
-        print("   # nebo umístěte PDB soubory do data/pdb_positive/")
+        print("\n❌ Žádné binding sites nalezeny!")
+        print(f"   Umístěte PDB soubory do: data/{config['ligand_name']}/PDB/positive/")
         return
     
     n_pos = sum(1 for bs in binding_sites if bs['label'] == 1)
@@ -604,18 +671,18 @@ def main():
     print("[KROK 3/5] Stavba grafového datasetu")
     print(f"{'='*60}")
     
-    graph_dataset = build_graph_dataset(binding_sites, include_ligand=config.get('include_ligand', True))
+    graph_dataset = build_graph_dataset(
+        binding_sites, include_ligand=config.get('include_ligand', True)
+    )
     
     # ---- KROK 4: Sekvenční dataset (volitelné) ----
     seq_dataset = None
     if not args.no_seq:
         print(f"\n{'='*60}")
-        print("[KROK 4/5] Sekvenční dataset (UniProt)")
+        print("[KROK 4/5] Sekvenční dataset")
         print(f"{'='*60}")
         
-        seq_dataset = load_sequence_data(
-            config['seq_csv'], config['esm_model'], config['cache_dir']
-        )
+        seq_dataset = load_sequence_data(config)
     
     # ---- KROK 5: Trénink ----
     print(f"\n{'='*60}")

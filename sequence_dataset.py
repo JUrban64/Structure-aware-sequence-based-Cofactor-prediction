@@ -10,6 +10,7 @@ Tento dataset extrahuje ESM embeddings z celých sekvencí
 a vytváří tensory pro SequenceBranch modelu.
 """
 
+import os
 import torch
 from torch.utils.data import Dataset
 import numpy as np
@@ -139,10 +140,12 @@ def load_sequences_from_csv(csv_path, cofactor_filter='NAD'):
     """
     Načte sekvence z CSV souboru.
     
-    Očekávaný formát:
-        uniprot_id,sequence,label,cofactor
-        P12345,MVLSPADKTN...,1,NAD
-        Q67890,MGKYVLTSIG...,0,
+    Podporované formáty sloupců:
+      A) Sequence,Cofactor_id,Cofactor_Name  (nový formát)
+      B) Entry,Protein names,Sequence,Cofactor_id,Cofactor_Name  (nový formát negative)
+      C) uniprot_id,sequence,label,cofactor  (starý formát)
+    
+    Label se odvodí z Cofactor_id: > 0 → positive, == 0 → negative.
     
     Args:
         csv_path: cesta k CSV
@@ -157,15 +160,79 @@ def load_sequences_from_csv(csv_path, cofactor_filter='NAD'):
     with open(csv_path, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if cofactor_filter and row.get('cofactor', '') != cofactor_filter:
-                if int(row['label']) == 1:
-                    continue  # skip positive examples for other cofactors
+            # Nový formát: Sequence + Cofactor_id
+            if 'Sequence' in row:
+                seq = row['Sequence'].strip()
+                cofactor_id = int(row.get('Cofactor_id', 0))
+                label = 1 if cofactor_id > 0 else 0
+                # Filtrování podle jména kofaktoru
+                cofactor_name = row.get('Cofactor_Name', '').strip()
+                if cofactor_filter and label == 1:
+                    if cofactor_name and cofactor_name != cofactor_filter:
+                        continue
+            # Starý formát: sequence + label
+            elif 'sequence' in row:
+                seq = row['sequence'].strip()
+                label = int(row.get('label', 0))
+                if cofactor_filter and row.get('cofactor', '') != cofactor_filter:
+                    if label == 1:
+                        continue
+            else:
+                continue
             
-            sequences.append(row['sequence'])
-            labels.append(int(row['label']))
+            if len(seq) > 10:  # Přeskoč příliš krátké sekvence
+                sequences.append(seq)
+                labels.append(label)
     
     print(f"Loaded {len(sequences)} sequences from {csv_path}")
     print(f"  Positive: {sum(labels)}, Negative: {len(labels) - sum(labels)}")
+    
+    return sequences, labels
+
+
+def load_sequences_from_separate_csvs(positive_csv, negative_csv, 
+                                       cofactor_filter='NAD',
+                                       max_negative=None):
+    """
+    Načte sekvence ze dvou oddělených CSV souborů (positive + negative).
+    
+    Args:
+        positive_csv: cesta k CSV s pozitivními sekvencemi
+        negative_csv: cesta k CSV s negativními sekvencemi
+        cofactor_filter: filtrovat kofaktor (pro positive)
+        max_negative: maximální počet negativních (pro balancování)
+    
+    Returns:
+        sequences, labels: lists
+    """
+    sequences = []
+    labels = []
+    
+    # Načti pozitivní
+    if os.path.exists(positive_csv):
+        pos_seq, pos_lab = load_sequences_from_csv(positive_csv, cofactor_filter)
+        sequences.extend(pos_seq)
+        labels.extend(pos_lab)
+    else:
+        print(f"  ⚠ Pozitivní CSV nenalezen: {positive_csv}")
+    
+    # Načti negativní
+    if os.path.exists(negative_csv):
+        neg_seq, neg_lab = load_sequences_from_csv(negative_csv, cofactor_filter=None)
+        if max_negative and len(neg_seq) > max_negative:
+            import random
+            random.seed(42)
+            idx = random.sample(range(len(neg_seq)), max_negative)
+            neg_seq = [neg_seq[i] for i in idx]
+            neg_lab = [neg_lab[i] for i in idx]
+            print(f"  Omezeno na {max_negative} negativních sekvencí")
+        sequences.extend(neg_seq)
+        labels.extend(neg_lab)
+    else:
+        print(f"  ⚠ Negativní CSV nenalezen: {negative_csv}")
+    
+    print(f"Celkem: {len(sequences)} sekvencí "
+          f"(pozitivní: {sum(labels)}, negativní: {len(labels) - sum(labels)})")
     
     return sequences, labels
 
