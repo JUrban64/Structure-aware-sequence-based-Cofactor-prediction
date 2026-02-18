@@ -585,7 +585,7 @@ def main():
     if os.path.exists(config['pdb_positive_dir']):
         pdb_count = len(glob.glob(os.path.join(config['pdb_positive_dir'], '*.pdb')))
         if pdb_count > 0:
-            print(f"\nPozitivní příklady (nativní {config['ligand_name']} vazba):\")
+            print(f"\nPozitivní příklady (nativní {config['ligand_name']} vazba):")
             pos_sites = extract_binding_sites(
                 config['pdb_positive_dir'],
                 config['ligand_name'],
