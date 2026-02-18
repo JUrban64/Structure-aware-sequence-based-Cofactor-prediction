@@ -167,6 +167,12 @@ class BindingSiteExtractor:
         """
         Extrahuje detailní informace o atomech ligandu.
         
+        Poznámka: U uměle dockovaných struktur (Boltz apod.) mohou být
+        atom names nestandardní (např. C50 místo C8). V takovém případě
+        bude functional_group = 'unknown', ale element type a souřadnice
+        jsou korektní – to stačí pro výpočet protein-ligand kontaktů
+        a rozlišení kvalitních vs špatných interakcí.
+        
         Returns:
             ligand_atoms: list of dicts, each with:
                 - 'name': atom name (e.g. 'C1', 'N1', 'PA')

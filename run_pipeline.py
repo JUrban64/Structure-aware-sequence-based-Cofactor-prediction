@@ -101,12 +101,24 @@ def parse_args():
 # KROK 1: Extrakce binding sites z PDB
 # ============================================================
 def extract_binding_sites(pdb_dir, ligand_name, distance_threshold, 
-                          label=1):
-    """Extrahuje binding sites ze všech PDB souborů ve složce."""
+                          label=1, recursive=False):
+    """Extrahuje binding sites ze všech PDB souborů ve složce.
+    
+    Args:
+        pdb_dir: cesta ke složce s PDB soubory
+        ligand_name: název ligandu (NAD, FAD, ...)
+        distance_threshold: práh vzdálenosti pro binding site (Å)
+        label: 1 = pozitivní (nativní vazba), 0 = negativní (špatná vazba)
+        recursive: hledat PDB i v podsložkách
+    """
     from Binding_site_ex import BindingSiteExtractor
     
     extractor = BindingSiteExtractor(distance_threshold=distance_threshold)
-    pdb_files = glob.glob(os.path.join(pdb_dir, '*.pdb'))
+    
+    if recursive:
+        pdb_files = glob.glob(os.path.join(pdb_dir, '**', '*.pdb'), recursive=True)
+    else:
+        pdb_files = glob.glob(os.path.join(pdb_dir, '*.pdb'))
     
     if not pdb_files:
         print(f"  ⚠ Žádné PDB soubory v {pdb_dir}")
@@ -459,7 +471,7 @@ def run_test(config):
     # Duplicitní data pro test
     print("\n[3] Sestavuji testovací dataset (10 kopií)...")
     test_sites = [bs_info.copy() for _ in range(10)]
-    # Polovina negativních
+    # Polovina negativních (simuluje uměle dockovaný NAD se špatnými interakcemi)
     for i in range(5, 10):
         test_sites[i] = bs_info.copy()
         test_sites[i]['label'] = 0
@@ -558,6 +570,7 @@ def main():
     print(f"Ligand: {config['ligand_name']}")
     print(f"PDB positive: {config['pdb_positive_dir']}")
     print(f"PDB negative: {config['pdb_negative_dir']}")
+    print(f"Koncept: pozitivní = nativní vazba, negativní = uměle dockovaný ligand")
     print(f"Seq positive: {config.get('seq_positive_csv', 'N/A')}")
     print(f"Seq negative: {config.get('seq_negative_csv', 'N/A')}")
     
@@ -568,11 +581,11 @@ def main():
     
     binding_sites = []
     
-    # Pozitivní (s kofaktorem)
+    # Pozitivní (nativní vazba kofaktoru – kvalitní interakce)
     if os.path.exists(config['pdb_positive_dir']):
         pdb_count = len(glob.glob(os.path.join(config['pdb_positive_dir'], '*.pdb')))
         if pdb_count > 0:
-            print(f"\nPozitivní příklady (s {config['ligand_name']}):")
+            print(f"\nPozitivní příklady (nativní {config['ligand_name']} vazba):\")
             pos_sites = extract_binding_sites(
                 config['pdb_positive_dir'],
                 config['ligand_name'],
@@ -585,54 +598,27 @@ def main():
     else:
         print(f"\n  ⚠ Složka neexistuje: {config['pdb_positive_dir']}")
     
-    # Negativní (bez kofaktoru)
+    # Negativní (uměle dockovaný kofaktor – špatné protein-ligand interakce)
+    # Negativní PDB obsahují stejný ligand (např. NAD), ale uměle umístěný
+    # (např. Boltz docking), takže protein-ligand interakce jsou nekvalitní.
+    # Model se učí rozlišovat kvalitní (nativní) vs špatné (dockované) interakce.
     neg_dir = config['pdb_negative_dir']
     if os.path.exists(neg_dir):
-        neg_pdb_files = glob.glob(os.path.join(neg_dir, '*.pdb'))
+        # Hledej PDB i v podsložkách (boltz_negatives_protonated/ apod.)
+        neg_pdb_files = glob.glob(os.path.join(neg_dir, '**', '*.pdb'), recursive=True)
+        if not neg_pdb_files:
+            neg_pdb_files = glob.glob(os.path.join(neg_dir, '*.pdb'))
         if neg_pdb_files:
-            print(f"\nNegativní příklady (bez {config['ligand_name']}):")
-            # Pro negativní: fake binding site = centrální oblast sekvence
-            from Binding_site_ex import BindingSiteExtractor
-            ext = BindingSiteExtractor(distance_threshold=config['distance_threshold'])
-            
-            neg_count = 0
-            for pdb_file in neg_pdb_files:
-                try:
-                    structure = ext.parser.get_structure('prot', pdb_file)
-                    model_s = structure[0]
-                    chain = next(iter(model_s))
-                    seq = ext._get_sequence(chain)
-                    
-                    if len(seq) < 20:
-                        continue
-                    
-                    center = len(seq) // 2
-                    bs_indices = list(range(max(0, center-10), min(len(seq), center+10)))
-                    bs_sequence = ''.join([seq[i] for i in bs_indices])
-                    
-                    n = len(bs_indices)
-                    contact = np.eye(n)
-                    for k in range(n-1):
-                        contact[k, k+1] = 1.0
-                        contact[k+1, k] = 1.0
-                    
-                    bs_info = {
-                        'full_sequence': seq,
-                        'binding_site_sequence': bs_sequence,
-                        'binding_site_indices': bs_indices,
-                        'binding_site_residues': [],
-                        'contact_map': contact,
-                        'n_binding_site': n,
-                        'ligand_name': 'NONE',
-                        'pdb_file': pdb_file,
-                        'label': 0
-                    }
-                    binding_sites.append(bs_info)
-                    neg_count += 1
-                except Exception:
-                    pass
-            
-            print(f"  ✓ {neg_count} negativních příkladů")
+            print(f"\nNegativní příklady (uměle dockovaný {config['ligand_name']}, "
+                  f"špatné interakce):")
+            neg_sites = extract_binding_sites(
+                neg_dir,
+                config['ligand_name'],
+                config['distance_threshold'],
+                label=0,
+                recursive=True
+            )
+            binding_sites.extend(neg_sites)
         else:
             print(f"\n  ℹ Složka {neg_dir} je prázdná – pokračuji bez negativních PDB")
     
