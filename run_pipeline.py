@@ -45,7 +45,7 @@ DEFAULT_CONFIG = {
     # Cesty (dynamicky sestaveny v main() podle ligandu)
     'data_root': os.path.join(BASE_DIR, 'data'),
     'pdb_positive_dir': os.path.join(BASE_DIR, 'data', 'NAD', 'PDB', 'positive', 'vycisteno_protonated'),
-    'pdb_negative_dir': os.path.join(BASE_DIR, 'data', 'NAD', 'PDB', 'negative'),
+    'pdb_negative_dir': os.path.join(BASE_DIR, 'data', 'NAD', 'PDB', 'negative', 'boltz_negatives_protonated'),
     'seq_positive_csv': os.path.join(BASE_DIR, 'data', 'NAD', 'sequences', 'positive', 'NAD_only_dataset.csv'),
     'seq_negative_csv': os.path.join(BASE_DIR, 'data', 'NAD', 'sequences', 'negative', 'NO_cofa_15000_id0.csv'),
     'cache_dir': os.path.join(BASE_DIR, 'cache'),
