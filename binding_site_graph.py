@@ -2,7 +2,7 @@ from torch_geometric.data import Data
 import torch
 import numpy as np
 from additional_features import (
-    create_node_features, create_ligand_node_features, LigandFeatures
+    create_node_features, LigandFeatures
 )
 
 
@@ -98,9 +98,14 @@ class BindingSiteGraphDataset:
         has_ligand = self.include_ligand and len(ligand_atoms) > 0
         
         if has_ligand:
-            ligand_features = create_ligand_node_features(bs_info)
+            lig_feat_extractor = LigandFeatures()
+            ligand_features = lig_feat_extractor.get_atom_features(
+                ligand_atoms,
+                bs_info.get('ligand_bonds', []),
+                bs_info.get('ligand_name', 'UNK')
+            )
             n_lig = ligand_features.shape[0]
-            ligand_dim = ligand_features.shape[1]  # 36
+            ligand_dim = ligand_features.shape[1]
         else:
             n_lig = 0
             ligand_dim = LigandFeatures.LIGAND_FEAT_DIM

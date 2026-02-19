@@ -5,7 +5,7 @@ import numpy as np
 # ============================================================
 
 # Prvky běžné v kofaktorech (pro one-hot encoding)
-LIGAND_ELEMENTS = ['C', 'N', 'O', 'P', 'S']  # 5D one-hot
+LIGAND_ELEMENTS = ['C', 'N', 'O', 'P', 'S', 'H']  # 6D one-hot (přidán H)
 
 # Funkční skupiny kofaktorů (pro one-hot encoding)
 FUNCTIONAL_GROUPS = [
@@ -299,22 +299,23 @@ def create_node_features(bs_info, use_esm=True, use_blosum=True,
     return node_features
 
 
-def create_ligand_node_features(bs_info):
-    """
-    Feature extraction pro ligandové uzly.
+# POZNÁMKA: Pro ligandové features použijte LigandFeatures.get_atom_features()
+# Standalone create_ligand_node_features() je DEPRECATED a odstraněna.
+# Viz binding_site_graph.py → _build_single_graph()
+
+
+def _get_parent_element(h_atom, residue):
+    """Najdi těžký atom, na který je vodík navázaný (nejbližší ne-H atom)."""
+    h_coord = h_atom.get_vector().get_array()
+    min_dist = float('inf')
+    parent_element = 'C'  # default
     
-    Args:
-        bs_info: dict z BindingSiteExtractor (musí obsahovat
-                 'ligand_atoms', 'ligand_bonds', 'ligand_name')
+    for atom in residue.get_atoms():
+        if atom.element.strip().upper() == 'H':
+            continue
+        dist = np.linalg.norm(atom.get_vector().get_array() - h_coord)
+        if dist < min_dist:
+            min_dist = dist
+            parent_element = atom.element.strip().upper()
     
-    Returns:
-        ligand_features: np.array [n_lig_atoms, 36]
-            (nebo [0, 36] pokud nejsou žádné ligandové atomy)
-    """
-    lig_feat = LigandFeatures()
-    
-    ligand_atoms = bs_info.get('ligand_atoms', [])
-    ligand_bonds = bs_info.get('ligand_bonds', [])
-    cofactor_name = bs_info.get('ligand_name', 'UNK')
-    
-    return lig_feat.get_atom_features(ligand_atoms, ligand_bonds, cofactor_name)
+    return parent_element

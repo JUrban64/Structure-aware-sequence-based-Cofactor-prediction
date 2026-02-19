@@ -255,7 +255,7 @@ if __name__ == '__main__':
         num_attention_heads=4,
         dropout=0.5,
         use_gat=True,
-        ligand_dim=36  # LigandFeatures.LIGAND_FEAT_DIM
+        ligand_dim=40  # LigandFeatures.LIGAND_FEAT_DIM
     )
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
