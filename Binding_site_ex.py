@@ -371,6 +371,10 @@ class BindingSiteExtractor:
                 if resname in three_to_one:
                     sequence.append(three_to_one[resname])
         
+        if len(sequence) == 0:
+            print(f"    ⚠ Prázdná sekvence z chain {chain.get_id()} "
+                  f"({sum(1 for _ in chain.get_residues())} residues celkem)")
+        
         return ''.join(sequence)
     
     def _three_to_one(self, three_letter):

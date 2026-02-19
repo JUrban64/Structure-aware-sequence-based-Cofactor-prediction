@@ -132,6 +132,12 @@ def extract_binding_sites(pdb_dir, ligand_name, distance_threshold,
             bs_info = extractor.extract_binding_site(
                 pdb_file, ligand_name=ligand_name
             )
+            
+            # Přeskoč pokud je sekvence prázdná
+            if not bs_info.get('full_sequence') or len(bs_info['full_sequence']) == 0:
+                print(f"    ⚠ Prázdná sekvence v {os.path.basename(pdb_file)} – přeskakuji")
+                continue
+            
             bs_info['label'] = label
             binding_sites.append(bs_info)
             
@@ -155,6 +161,18 @@ def compute_esm_embeddings(binding_sites, esm_model_name, cache_dir):
     cache_file = os.path.join(cache_dir, 'esm_embeddings.pkl')
     os.makedirs(cache_dir, exist_ok=True)
     
+    # Odfiltruj binding sites s prázdnou sekvencí
+    empty_count = 0
+    for bs in binding_sites:
+        if not bs.get('full_sequence') or len(bs['full_sequence'].strip()) == 0:
+            empty_count += 1
+    if empty_count > 0:
+        print(f"  ⚠ {empty_count} binding sites má prázdnou sekvenci – budou přeskočeny")
+        binding_sites[:] = [
+            bs for bs in binding_sites 
+            if bs.get('full_sequence') and len(bs['full_sequence'].strip()) > 0
+        ]
+    
     # Zkus načíst z cache
     if os.path.exists(cache_file):
         print("  Načítám ESM embeddingy z cache...")
@@ -175,17 +193,33 @@ def compute_esm_embeddings(binding_sites, esm_model_name, cache_dir):
     esm = ESMFeatureExtractor(model_name=esm_model_name)
     
     embeddings_cache = []
+    skipped = 0
+    to_remove = []
     for i, bs in enumerate(binding_sites):
-        emb = esm.extract_binding_site_embeddings(
-            bs['full_sequence'],
-            bs['binding_site_indices']
-        )
-        bs['esm_embeddings'] = emb
-        embeddings_cache.append(emb)
+        try:
+            emb = esm.extract_binding_site_embeddings(
+                bs['full_sequence'],
+                bs['binding_site_indices']
+            )
+            bs['esm_embeddings'] = emb
+            embeddings_cache.append(emb)
+        except (ValueError, IndexError) as e:
+            print(f"    ⚠ Přeskakuji binding site {i} "
+                  f"({os.path.basename(bs.get('pdb_file', '?'))}): {e}")
+            to_remove.append(i)
+            skipped += 1
+            continue
         
         if (i + 1) % 10 == 0:
             print(f"    [{i+1}/{len(binding_sites)}] "
                   f"shape: {emb.shape}")
+    
+    # Odstraň problematické binding sites (odzadu, aby se neposouvaly indexy)
+    for i in sorted(to_remove, reverse=True):
+        binding_sites.pop(i)
+    
+    if skipped > 0:
+        print(f"  ⚠ Přeskočeno {skipped} binding sites kvůli chybám")
     
     # Ulož cache
     with open(cache_file, 'wb') as f:
