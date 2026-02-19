@@ -36,11 +36,16 @@ class ESMFeatureExtractor:
         Returns:
             embeddings: [L, 1280] numpy array
         """
-        # Tokenize
+        if not sequence or len(sequence) == 0:
+            raise ValueError("Empty sequence provided to extract_embeddings")
+        
+        # Tokenize – přidáno truncation pro dlouhé sekvence
         inputs = self.tokenizer(
             sequence, 
             return_tensors="pt",
-            add_special_tokens=True  # Adds <cls> and <eos>
+            add_special_tokens=True,  # Adds <cls> and <eos>
+            truncation=True,
+            max_length=1024
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
@@ -64,11 +69,26 @@ class ESMFeatureExtractor:
         Returns:
             bs_embeddings: [n_bs, 1280]
         """
-        # Get full embeddings
+        # Get full embeddings (může být oříznuté na 1022 residues)
         full_embeddings = self.extract_embeddings(full_sequence)
         
+        # Filtruj indexy, které jsou mimo rozsah embeddingů (po truncation)
+        max_idx = full_embeddings.shape[0]
+        valid_indices = [i for i in bs_indices if i < max_idx]
+        
+        if len(valid_indices) == 0:
+            raise ValueError(
+                f"No valid binding site indices after truncation. "
+                f"Embedding length: {max_idx}, "
+                f"BS indices range: {min(bs_indices)}-{max(bs_indices)}"
+            )
+        
+        if len(valid_indices) < len(bs_indices):
+            print(f"  ⚠ {len(bs_indices) - len(valid_indices)} BS residues "
+                  f"mimo rozsah embeddingů (seq truncated to {max_idx})")
+        
         # Select binding site residues
-        bs_embeddings = full_embeddings[bs_indices, :]
+        bs_embeddings = full_embeddings[valid_indices, :]
         
         return bs_embeddings
     
