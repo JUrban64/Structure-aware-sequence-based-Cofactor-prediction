@@ -1,0 +1,30 @@
+name: sqbcp_gpu
+channels:
+  - pytorch
+  - pyg
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  # Core scientific
+  - numpy
+  - scipy
+  - scikit-learn
+
+  # PyTorch (CPU verze – pro GPU nahradit pytorch-cuda=12.1)
+  - pytorch-cuda=12.1
+  - torchvision
+  - torchaudio            
+
+  # PyTorch Geometric
+  - pyg::pyg
+
+  # Bioinformatics
+  - conda-forge::biopython
+
+  # pip-only packages
+  - pip
+  - pip:
+      - transformers      # HuggingFace (ESM-2 model)
+      - sentencepiece     # tokenizer backend pro transformers
