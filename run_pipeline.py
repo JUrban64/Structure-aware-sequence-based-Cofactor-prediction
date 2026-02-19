@@ -54,7 +54,7 @@ DEFAULT_CONFIG = {
     'ligand_name': 'NAD',
     'distance_threshold': 6.0,
     
-    # ESM model
+    # ESM model porotm tam vratit 650
     'esm_model': 'facebook/esm2_t33_650M_UR50D',
     'esm_dim': 1280,
     
@@ -92,6 +92,10 @@ def parse_args():
     parser.add_argument('--ligand', type=str, default='NAD')
     parser.add_argument('--no-seq', action='store_true',
                         help='Trénovat pouze na PDB (bez sequence branch)')
+    parser.add_argument('--test-data', action='store_true',
+                        help='Použít malý testovací dataset (data/NAD/test/) '
+                             'pro ověření funkčnosti celého pipeline '
+                             '(10 pozitivních + 5 negativních PDB a sekvencí)')
     parser.add_argument('--esm-model', type=str, 
                         default='facebook/esm2_t33_650M_UR50D')
     return parser.parse_args()
@@ -145,7 +149,7 @@ def extract_binding_sites(pdb_dir, ligand_name, distance_threshold,
                 print(f"    [{i+1}/{len(pdb_files)}] "
                       f"Zpracováno {len(binding_sites)} binding sites")
         except Exception as e:
-            pass  # Tiché přeskočení problematických souborů
+            print(f"    ✗ {os.path.basename(pdb_file)}: {e}")
     
     print(f"  ✓ {len(binding_sites)}/{len(pdb_files)} úspěšně extrahováno")
     return binding_sites
@@ -529,6 +533,59 @@ def run_test(config):
 # ============================================================
 # MAIN
 # ============================================================
+def _setup_test_data_paths(config):
+    """Nastaví cesty na malý testovací dataset (data/<ligand>/test/).
+    
+    Testovací složka obsahuje:
+      - 10 pozitivních PDB struktur
+      - 5 negativních PDB struktur
+      - 10 pozitivních sekvencí (CSV)
+      - 5 negativních sekvencí (CSV)
+    
+    Slouží k ověření funkčnosti celého pipeline bez nutnosti
+    zpracovávat stovky/tisíce souborů.
+    """
+    ligand = config['ligand_name']
+    data_root = config['data_root']
+    test_dir = os.path.join(data_root, ligand, 'test')
+    
+    if not os.path.isdir(test_dir):
+        print(f"  ❌ Testovací složka neexistuje: {test_dir}")
+        print(f"     Vytvořte ji pomocí: mkdir -p {test_dir}/PDB/{{positive,negative}}")
+        print(f"     a zkopírujte do ní několik PDB souborů.")
+        return config
+    
+    print(f"  Používám testovací data z: {test_dir}")
+    
+    # PDB cesty
+    config['pdb_positive_dir'] = os.path.join(test_dir, 'PDB', 'positive')
+    config['pdb_negative_dir'] = os.path.join(test_dir, 'PDB', 'negative')
+    
+    # Sekvenční cesty
+    seq_pos = os.path.join(test_dir, 'sequences', 'positive')
+    seq_neg = os.path.join(test_dir, 'sequences', 'negative')
+    
+    if os.path.isdir(seq_pos):
+        csvs = glob.glob(os.path.join(seq_pos, '*.csv'))
+        if csvs:
+            config['seq_positive_csv'] = csvs[0]
+    
+    if os.path.isdir(seq_neg):
+        csvs = glob.glob(os.path.join(seq_neg, '*.csv'))
+        if csvs:
+            config['seq_negative_csv'] = csvs[0]
+    
+    # Separátní cache pro test data
+    config['cache_dir'] = os.path.join(data_root, '..', 'cache', f'{ligand}_test')
+    
+    # Menší počet epoch pro test
+    config['num_epochs'] = min(config['num_epochs'], 10)
+    config['batch_size_graph'] = min(config['batch_size_graph'], 8)
+    config['batch_size_seq'] = min(config['batch_size_seq'], 8)
+    
+    return config
+
+
 def _setup_cofactor_paths(config):
     """Nastaví cesty podle zvoleného kofaktoru a datové struktury."""
     ligand = config['ligand_name']
@@ -589,7 +646,9 @@ def main():
     config['esm_model'] = args.esm_model
     
     # Nastav cesty dynamicky podle kofaktoru
-    if not args.pdb_dir:  # Pokud uživatel nezadal explicitní cestu
+    if args.test_data:
+        config = _setup_test_data_paths(config)
+    elif not args.pdb_dir:  # Pokud uživatel nezadal explicitní cestu
         config = _setup_cofactor_paths(config)
     
     # Quick test

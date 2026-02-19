@@ -1,6 +1,7 @@
 import numpy as np
 from Bio.PDB import PDBParser, Selection
 from scipy.spatial.distance import cdist
+import tempfile
 import sys 
 import glob
 
@@ -62,6 +63,99 @@ class BindingSiteExtractor:
         self.threshold = distance_threshold
         self.parser = PDBParser(QUIET=True)
     
+    def _preprocess_pdb(self, pdb_file):
+        """Fix PDB files with 4-char HETATM residue names (e.g. LIG1 from Boltz).
+        
+        PDB format allows only 3 characters for residue name (columns 18-20,
+        1-indexed). Boltz-docked structures use 4-char names like 'LIG1' which
+        shifts chain ID and resSeq by 1 position, causing BioPython PDBParser
+        to crash with 'invalid literal for int()'.
+        
+        If no fix is needed, returns the original path (no temp file created).
+        
+        Returns:
+            (path, needs_cleanup): path to (possibly fixed) PDB file and whether
+                                   it's a temp file that should be deleted.
+        """
+        needs_fix = False
+        with open(pdb_file, 'r') as f:
+            lines = f.readlines()
+        
+        for line in lines:
+            if (line.startswith('HETATM') or line.startswith('ATOM  ')):
+                if len(line) > 21 and line[20] != ' ':
+                    needs_fix = True
+                    break
+        
+        if not needs_fix:
+            return pdb_file, False
+        
+        # Fix lines where residue name bleeds into column 20
+        fixed_lines = []
+        for line in lines:
+            if ((line.startswith('HETATM') or line.startswith('ATOM  '))
+                    and len(line) > 21 and line[20] != ' '):
+                # Remove the extra character at position 20, shift rest left
+                line = line[:20] + line[21:]
+                # Pad to at least 80 chars to maintain PDB format
+                if len(line) < 81:  # 80 chars + newline
+                    line = line.rstrip('\n').ljust(80) + '\n'
+            fixed_lines.append(line)
+        
+        # Write to temp file
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False)
+        tmp.writelines(fixed_lines)
+        tmp.close()
+        return tmp.name, True
+    
+    def _resolve_ligand_name(self, structure, ligand_name):
+        """Resolve the actual residue name of the ligand in the PDB file.
+        
+        Boltz-docked structures often use generic names like 'LIG1' instead
+        of the real cofactor name (e.g. 'NAD'). This method first checks for
+        the expected name, then falls back to any HETATM residue that is not
+        water (HOH/WAT) and has enough heavy atoms to be a cofactor.
+        
+        Args:
+            structure: Bio.PDB structure
+            ligand_name: expected residue name (e.g. 'NAD')
+        
+        Returns:
+            resolved_name: str – the actual residue name found in the PDB
+        """
+        # 1. Try the expected name first
+        if self._get_ligand_coords(structure, ligand_name) is not None:
+            return ligand_name
+        
+        # 2. Collect all HETATM residue names (skip water and common ions)
+        skip_names = {'HOH', 'WAT', 'DOD', 'SO4', 'PO4', 'GOL', 'EDO',
+                      'ACE', 'NME', 'NH2', 'CL', 'NA', 'MG', 'ZN', 'CA',
+                      'FE', 'MN', 'K', 'IOD', 'BR'}
+        hetatm_candidates = {}  # name → atom_count
+        
+        for model_obj in structure:
+            for chain in model_obj:
+                for residue in chain:
+                    het_flag = residue.get_id()[0]
+                    if het_flag.startswith('H') or het_flag == 'W':
+                        resname = residue.get_resname().strip()
+                        if resname not in skip_names:
+                            n_atoms = sum(1 for a in residue.get_atoms()
+                                          if a.element.strip() != 'H')
+                            hetatm_candidates[resname] = (
+                                hetatm_candidates.get(resname, 0) + n_atoms
+                            )
+        
+        if not hetatm_candidates:
+            raise ValueError(f"Ligand {ligand_name} not found and no HETATM "
+                             f"candidates in structure")
+        
+        # Pick the candidate with the most heavy atoms (most likely the cofactor)
+        best_name = max(hetatm_candidates, key=hetatm_candidates.get)
+        print(f"    ℹ Ligand '{ligand_name}' nenalezen, použit fallback: "
+              f"'{best_name}' ({hetatm_candidates[best_name]} heavy atoms)")
+        return best_name
+
     def extract_binding_site(self, pdb_file, ligand_name='NAD'):
         """
         Args:
@@ -71,7 +165,17 @@ class BindingSiteExtractor:
         Returns:
             binding_site_info: dict with binding site data
         """
-        structure = self.parser.get_structure('protein', pdb_file)
+        # Preprocess PDB to fix 4-char HETATM residue names (Boltz LIG1 etc.)
+        parsed_path, needs_cleanup = self._preprocess_pdb(pdb_file)
+        try:
+            structure = self.parser.get_structure('protein', parsed_path)
+        finally:
+            if needs_cleanup:
+                import os
+                os.unlink(parsed_path)
+        
+        # Resolve actual ligand name (handles Boltz-docked LIG1 etc.)
+        actual_ligand_name = self._resolve_ligand_name(structure, ligand_name)
         
         # Get protein chain (usually chain A)
         model = structure[0]
@@ -87,11 +191,11 @@ class BindingSiteExtractor:
         # Extract full sequence
         full_sequence = self._get_sequence(protein_chain)
         
-        # Get ligand coordinates
-        ligand_coords = self._get_ligand_coords(structure, ligand_name)
+        # Get ligand coordinates (using resolved name)
+        ligand_coords = self._get_ligand_coords(structure, actual_ligand_name)
         
         if ligand_coords is None:
-            raise ValueError(f"Ligand {ligand_name} not found")
+            raise ValueError(f"Ligand {actual_ligand_name} not found")
         
         # Find binding site residues
         binding_site_residues = []
@@ -133,17 +237,18 @@ class BindingSiteExtractor:
             'binding_site_residues': binding_site_residues,
             'contact_map': local_contact_map,
             'n_binding_site': len(binding_site_residues),
-            'ligand_name': ligand_name,
+            'ligand_name': ligand_name,  # Uložíme původní (logický) název
+            'actual_ligand_name': actual_ligand_name,  # Skutečný název v PDB
             'pdb_file': pdb_file,
             # Ligand info pro protein-ligand interakční graf
-            'ligand_atoms': self._extract_ligand_atoms(structure, ligand_name),
+            'ligand_atoms': self._extract_ligand_atoms(structure, actual_ligand_name),
             'ligand_bonds': self._compute_ligand_bonds(
-                self._extract_ligand_atoms(structure, ligand_name)
+                self._extract_ligand_atoms(structure, actual_ligand_name)
             ),
             'protein_ligand_contacts': self._compute_protein_ligand_contacts(
                 binding_site_residues, 
-                self._get_ligand_coords(structure, ligand_name),
-                structure, ligand_name
+                self._get_ligand_coords(structure, actual_ligand_name),
+                structure, actual_ligand_name
             ),
         }
     
