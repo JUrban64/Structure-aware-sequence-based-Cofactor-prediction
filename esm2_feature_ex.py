@@ -68,6 +68,8 @@ class ESMFeatureExtractor:
         
         Returns:
             bs_embeddings: [n_bs, 1280]
+            valid_indices: list of indices that were actually used
+                           (after truncation filtering)
         """
         # Get full embeddings (může být oříznuté na 1022 residues)
         full_embeddings = self.extract_embeddings(full_sequence)
@@ -90,7 +92,7 @@ class ESMFeatureExtractor:
         # Select binding site residues
         bs_embeddings = full_embeddings[valid_indices, :]
         
-        return bs_embeddings
+        return bs_embeddings, valid_indices
     
     def batch_extract(self, sequences, batch_size=8):
         """

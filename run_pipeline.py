@@ -183,10 +183,12 @@ def compute_esm_embeddings(binding_sites, esm_model_name, cache_dir):
         with open(cache_file, 'rb') as f:
             cached = pickle.load(f)
         
-        # Zkontroluj, jestli odpovídají
         if len(cached) == len(binding_sites):
             for i, bs in enumerate(binding_sites):
-                bs['esm_embeddings'] = cached[i]
+                bs['esm_embeddings'] = cached[i]['embeddings']
+                # Aktualizuj binding site info podle valid indices
+                if 'valid_indices' in cached[i]:
+                    _update_bs_for_valid_indices(bs, cached[i]['valid_indices'])
             print(f"  ✓ {len(cached)} embeddingů načteno z cache")
             return
         else:
@@ -201,12 +203,19 @@ def compute_esm_embeddings(binding_sites, esm_model_name, cache_dir):
     to_remove = []
     for i, bs in enumerate(binding_sites):
         try:
-            emb = esm.extract_binding_site_embeddings(
+            emb, valid_indices = esm.extract_binding_site_embeddings(
                 bs['full_sequence'],
                 bs['binding_site_indices']
             )
             bs['esm_embeddings'] = emb
-            embeddings_cache.append(emb)
+            
+            # Aktualizuj binding site info aby odpovídal valid indices
+            _update_bs_for_valid_indices(bs, valid_indices)
+            
+            embeddings_cache.append({
+                'embeddings': emb,
+                'valid_indices': valid_indices
+            })
         except (ValueError, IndexError) as e:
             print(f"    ⚠ Přeskakuji binding site {i} "
                   f"({os.path.basename(bs.get('pdb_file', '?'))}): {e}")
@@ -218,7 +227,7 @@ def compute_esm_embeddings(binding_sites, esm_model_name, cache_dir):
             print(f"    [{i+1}/{len(binding_sites)}] "
                   f"shape: {emb.shape}")
     
-    # Odstraň problematické binding sites (odzadu, aby se neposouvaly indexy)
+    # Odstraň problematické binding sites (odzadu)
     for i in sorted(to_remove, reverse=True):
         binding_sites.pop(i)
     
@@ -229,6 +238,69 @@ def compute_esm_embeddings(binding_sites, esm_model_name, cache_dir):
     with open(cache_file, 'wb') as f:
         pickle.dump(embeddings_cache, f)
     print(f"  ✓ {len(embeddings_cache)} embeddingů uloženo do cache")
+
+
+def _update_bs_for_valid_indices(bs, valid_indices):
+    """Aktualizuje binding site info tak, aby odpovídal pouze 
+    residuím, pro které máme ESM embeddingy (po truncation).
+    
+    Toto zajistí že ESM [n, 1280], BLOSUM [n, 20], PhysChem [n, 7] 
+    a Position [n, 3] mají STEJNÉ n.
+    """
+    original_indices = bs['binding_site_indices']
+    
+    # Pokud se nic nezměnilo, nic neděláme
+    if len(valid_indices) == len(original_indices):
+        return
+    
+    # Zjisti, které pozice v původním seznamu zůstaly
+    valid_set = set(valid_indices)
+    keep_mask = [idx in valid_set for idx in original_indices]
+    
+    # Aktualizuj indices
+    bs['binding_site_indices'] = valid_indices
+    
+    # Aktualizuj sekvenci
+    old_seq = bs['binding_site_sequence']
+    bs['binding_site_sequence'] = ''.join(
+        aa for aa, keep in zip(old_seq, keep_mask) if keep
+    )
+    
+    # Aktualizuj residues (pokud existují)
+    if 'binding_site_residues' in bs:
+        bs['binding_site_residues'] = [
+            res for res, keep in zip(bs['binding_site_residues'], keep_mask) 
+            if keep
+        ]
+    
+    # Aktualizuj n_binding_site
+    bs['n_binding_site'] = len(valid_indices)
+    
+    # Aktualizuj kontaktní mapu (ořízni řádky/sloupce)
+    if 'contact_map' in bs:
+        old_cm = bs['contact_map']
+        keep_idx = [i for i, k in enumerate(keep_mask) if k]
+        bs['contact_map'] = old_cm[np.ix_(keep_idx, keep_idx)]
+    
+    # Aktualizuj protein-ligand kontakty (přeindexuj protein_idx)
+    if 'protein_ligand_contacts' in bs:
+        old_to_new = {}
+        new_idx = 0
+        for old_idx, keep in enumerate(keep_mask):
+            if keep:
+                old_to_new[old_idx] = new_idx
+                new_idx += 1
+        
+        new_contacts = []
+        for c in bs['protein_ligand_contacts']:
+            if c['protein_idx'] in old_to_new:
+                new_c = c.copy()
+                new_c['protein_idx'] = old_to_new[c['protein_idx']]
+                new_contacts.append(new_c)
+        bs['protein_ligand_contacts'] = new_contacts
+    
+    print(f"    ℹ BS aktualizován: {len(original_indices)} → "
+          f"{len(valid_indices)} residues (ESM truncation)")
 
 
 # ============================================================
