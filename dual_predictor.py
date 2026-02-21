@@ -8,18 +8,21 @@ Umožňuje trénovat na:
 
 Architektura (s protein-ligand interakčním grafem):
 
-  ┌────────────────────────────────────────────┐
-  │ GNN Branch (heterogenní graf)              │
-  │                                            │
-  │  Protein nodes ──P-P──▶ GAT ◀──P-L──┐     │
-  │  (1310D → proj)                      │     │
-  │                         GAT ◀──L-L──┐│     │
-  │  Ligand nodes ─────────────────────▶ ││    │
-  │  (36D → proj)                        ▼▼    │
-  │                      attention pooling     │
-  │                      (protein nodes only)  │
-  │                      → graph emb [H]       │
-  └──────────────────────┬─────────────────────┘
+  ┌─────────────────────────────────────────────────────┐
+  │ GNN Branch (heterogenní graf) — Varianta C          │
+  │                                                     │
+  │  Protein nodes:                                     │
+  │    ESM(1280) → compress(64) ─┐                      │
+  │    BLOSUM+PhysChem+Pos(30) ──┤→ [94D] → proj(256)   │
+  │                              │                      │
+  │  Protein → P-P → GAT ◀── P-L ──┐                   │
+  │                    GAT ◀── L-L ──┐                  │
+  │  Ligand nodes ──────────────────▶│                   │
+  │  (36D → proj)                    ▼▼                 │
+  │                      attention pooling              │
+  │                      (protein nodes only)           │
+  │                      → graph emb [H]                │
+  └──────────────────────┬──────────────────────────────┘
                          │
   ┌──────────────────────┴──────────────────────┐
   │              Shared Classifier              │
@@ -147,17 +150,21 @@ class GNNBranch(nn.Module):
     """
     Zpracovává protein-ligand interakční graf.
     
-    Klíčové úpravy oproti homogennímu grafu:
-      - Separate input projection pro protein (1310D) a ligand (36D) uzly
-      - Node type embedding přidaný k uzlovým features
+    Varianta C: Kompresovaný ESM v grafu.
+      - ESM embeddingy (1280D) se kompresují na esm_compress_dim (64D)
+      - Concat s BLOSUM+PhysChem+Pos (30D) → 94D
+      - Projekce 94D → hidden_dim (256)
+      → ESM identita zachovaná, ale nedominuje nad ostatními features
+      → Sekvenční větev zpracovává plný ESM (1280D) → komplementární
+    
+    Další vlastnosti:
+      - Node type embedding (protein=0, ligand=1)
       - Edge type embedding (P-P=0, P-L=1, L-L=2) 
-      - Attention pooling POUZE přes protein uzly (graf embedding
-        reprezentuje protein, ne ligand)
+      - Attention pooling POUZE přes protein uzly
     
     Vstup: PyG Batch s atributy:
         x, edge_index, edge_attr, batch,
-        node_type [N], edge_type [E],
-        n_protein_nodes, protein_dim, ligand_dim
+        node_type [N], edge_type [E]
     
     Výstup: graph embedding [batch_size, 2*hidden_dim]
     """
@@ -169,27 +176,39 @@ class GNNBranch(nn.Module):
     def __init__(self, node_dim=1310, hidden_dim=256, 
                  num_gnn_layers=3, num_attention_heads=4,
                  dropout=0.5, use_gat=True,
-                 ligand_dim=None):
+                 ligand_dim=None,
+                 esm_dim=1280, esm_compress_dim=64):
         super().__init__()
         
         self.hidden_dim = hidden_dim
         self.use_gat = use_gat
-        self.node_dim = node_dim  # protein feature dim
+        self.node_dim = node_dim  # protein feature dim (1310 = ESM + rest)
+        self.esm_dim = esm_dim
+        self.esm_compress_dim = esm_compress_dim
+        self.non_esm_dim = node_dim - esm_dim  # 30 = BLOSUM(20) + PhysChem(7) + Pos(3)
         
         if ligand_dim is None:
             ligand_dim = LigandFeatures.LIGAND_FEAT_DIM  # 36
         self.ligand_dim = ligand_dim
         
-        # ---- Separate input projections ----
-        # Protein: 1310D → hidden_dim
+        # ---- ESM Compressor: 1280 → 64 ----
+        # Kompresuje ESM embedding aby nedominoval nad BLOSUM/PhysChem/Pos
+        self.esm_compressor = nn.Sequential(
+            nn.Linear(esm_dim, esm_compress_dim),
+            nn.LayerNorm(esm_compress_dim),
+            nn.ReLU()
+        )
+        
+        # ---- Protein projection: 94D (64+30) → hidden_dim ----
+        protein_input_dim = esm_compress_dim + self.non_esm_dim  # 94
         self.protein_projection = nn.Sequential(
-            nn.Linear(node_dim, hidden_dim),
+            nn.Linear(protein_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
-        # Ligand: 36D → hidden_dim
+        # ---- Ligand: 36D → hidden_dim ----
         self.ligand_projection = nn.Sequential(
             nn.Linear(ligand_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -254,9 +273,15 @@ class GNNBranch(nn.Module):
         h = torch.zeros(x.size(0), self.hidden_dim, device=x.device)
         
         if protein_mask.any():
-            # Protein uzly: vezmi jen prvních protein_dim features
+            # Protein uzly: rozděl na ESM a non-ESM část
             prot_x = x[protein_mask, :self.node_dim]
-            h[protein_mask] = self.protein_projection(prot_x)
+            esm_part = prot_x[:, :self.esm_dim]        # [n_prot, 1280]
+            non_esm_part = prot_x[:, self.esm_dim:]     # [n_prot, 30]
+            # Kompresuj ESM: 1280 → 64
+            esm_compressed = self.esm_compressor(esm_part)  # [n_prot, 64]
+            # Concat: [64 | 30] = 94D
+            prot_combined = torch.cat([esm_compressed, non_esm_part], dim=1)
+            h[protein_mask] = self.protein_projection(prot_combined)
         
         if ligand_mask.any():
             # Ligand uzly: vezmi jen prvních ligand_dim features
@@ -366,6 +391,7 @@ class DualBranchPredictor(nn.Module):
                  # GNN branch params
                  node_dim=1310,
                  ligand_dim=None,  # None → LigandFeatures.LIGAND_FEAT_DIM (36)
+                 esm_compress_dim=64,  # ESM komprese v grafu (Varianta C)
                  # Shared params
                  hidden_dim=256,
                  num_gnn_layers=3,
@@ -376,7 +402,7 @@ class DualBranchPredictor(nn.Module):
         
         self.hidden_dim = hidden_dim
         
-        # ---- GNN Branch ----
+        # ---- GNN Branch (Varianta C: kompresovaný ESM) ----
         self.gnn_branch = GNNBranch(
             node_dim=node_dim,
             hidden_dim=hidden_dim,
@@ -384,7 +410,9 @@ class DualBranchPredictor(nn.Module):
             num_attention_heads=num_attention_heads,
             dropout=dropout,
             use_gat=use_gat,
-            ligand_dim=ligand_dim
+            ligand_dim=ligand_dim,
+            esm_dim=esm_dim,
+            esm_compress_dim=esm_compress_dim
         )
         # GNN branch outputs 2*hidden_dim, project to hidden_dim
         self.gnn_proj = nn.Sequential(
@@ -493,6 +521,7 @@ if __name__ == '__main__':
         esm_dim=1280,
         node_dim=1310,
         ligand_dim=36,  # LigandFeatures.LIGAND_FEAT_DIM
+        esm_compress_dim=64,  # Varianta C: ESM 1280 → 64 v grafu
         hidden_dim=256,
         num_gnn_layers=3,
         num_attention_heads=4,

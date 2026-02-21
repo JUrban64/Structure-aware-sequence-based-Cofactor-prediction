@@ -59,7 +59,8 @@ DEFAULT_CONFIG = {
     'esm_dim': 1280,
     
     # Model
-    'node_dim': 1310,  # 1280 + 20 + 7 + 3
+    'node_dim': 1310,  # 1280 + 20 + 7 + 3 (uloženo v grafu, ESM se kompresuje v modelu)
+    'esm_compress_dim': 64,  # Varianta C: ESM 1280 → 64 v grafové větvi
     'ligand_dim': 36,  # LigandFeatures.LIGAND_FEAT_DIM
     'hidden_dim': 256,
     'num_gnn_layers': 3,
@@ -467,7 +468,8 @@ def train_dual(config, graph_dataset, seq_dataset=None):
         num_attention_heads=config['num_attention_heads'],
         dropout=config['dropout'],
         use_gat=config['use_gat'],
-        ligand_dim=config.get('ligand_dim', 36)
+        ligand_dim=config.get('ligand_dim', 36),
+        esm_compress_dim=config.get('esm_compress_dim', 64)
     )
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -521,7 +523,9 @@ def train_gnn_only(config, graph_dataset):
         num_attention_heads=config['num_attention_heads'],
         dropout=config['dropout'],
         use_gat=config['use_gat'],
-        ligand_dim=config.get('ligand_dim', 36)
+        ligand_dim=config.get('ligand_dim', 36),
+        esm_dim=config.get('esm_dim', 1280),
+        esm_compress_dim=config.get('esm_compress_dim', 64)
     )
     
     print(f"  Model: {sum(p.numel() for p in model.parameters()):,} parametrů")

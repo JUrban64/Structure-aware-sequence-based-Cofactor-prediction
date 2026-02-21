@@ -1,7 +1,7 @@
 #!/bin/bash
-#PBS -N TRAIN_SQ_test_7
+#PBS -N TRAIN_SQ_test_8
 #PBS -l select=1:ncpus=2:ngpus=1:mem=70gb:scratch_ssd=70gb
-#PBS -l walltime=06:00:00
+#PBS -l walltime=12:00:00
 
 
 

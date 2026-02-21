@@ -10,9 +10,15 @@ class BindingSiteNADPredictor(nn.Module):
     GNN model for cofactor binding prediction from protein-ligand 
     interaction graphs.
     
+    Varianta C: Kompresovaný ESM v grafu.
+      - ESM embeddingy (1280D) se kompresují na esm_compress_dim (64D)
+      - Concat s BLOSUM+PhysChem+Pos (30D) → 94D
+      - Projekce 94D → hidden_dim (256)
+    
     Features:
     - Heterogenní graf: protein residues + ligand atomy
-    - Separate input projection pro protein (1310D) a ligand (36D)
+    - ESM compressor (1280 → 64) + separate projection pro protein (94D)
+    - Separate input projection pro ligand (36D)
     - Node type embedding (protein=0, ligand=1)
     - Attention pooling POUZE přes protein uzly
     - Multiple aggregation heads
@@ -27,22 +33,39 @@ class BindingSiteNADPredictor(nn.Module):
                  num_attention_heads=4,
                  dropout=0.5,
                  use_gat=False,
-                 ligand_dim=None):
+                 ligand_dim=None,
+                 esm_dim=1280,
+                 esm_compress_dim=64):
         super().__init__()
         
         self.node_dim = node_dim
         self.hidden_dim = hidden_dim
         self.use_gat = use_gat
+        self.esm_dim = esm_dim
+        self.esm_compress_dim = esm_compress_dim
+        self.non_esm_dim = node_dim - esm_dim  # 30
         
         if ligand_dim is None:
             ligand_dim = LigandFeatures.LIGAND_FEAT_DIM  # 36
         self.ligand_dim = ligand_dim
         
         # ============================================
+        # ESM COMPRESSOR (Varianta C)
+        # ============================================
+        # 1280 → 64: kompresuje ESM aby nedominoval
+        self.esm_compressor = nn.Sequential(
+            nn.Linear(esm_dim, esm_compress_dim),
+            nn.LayerNorm(esm_compress_dim),
+            nn.ReLU()
+        )
+        
+        # ============================================
         # SEPARATE INPUT PROJECTIONS
         # ============================================
+        # Protein: 94D (64 compressed ESM + 30 other) → hidden_dim
+        protein_input_dim = esm_compress_dim + self.non_esm_dim  # 94
         self.protein_projection = nn.Sequential(
-            nn.Linear(node_dim, hidden_dim),
+            nn.Linear(protein_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout)
@@ -150,7 +173,12 @@ class BindingSiteNADPredictor(nn.Module):
         
         if protein_mask.any():
             prot_x = x[protein_mask, :self.node_dim]
-            h[protein_mask] = self.protein_projection(prot_x)
+            # Varianta C: rozděl ESM a non-ESM, kompresuj ESM
+            esm_part = prot_x[:, :self.esm_dim]        # [n_prot, 1280]
+            non_esm_part = prot_x[:, self.esm_dim:]     # [n_prot, 30]
+            esm_compressed = self.esm_compressor(esm_part)  # [n_prot, 64]
+            prot_combined = torch.cat([esm_compressed, non_esm_part], dim=1)  # [n_prot, 94]
+            h[protein_mask] = self.protein_projection(prot_combined)
         
         if ligand_mask.any():
             lig_x = x[ligand_mask, :self.ligand_dim]
@@ -255,10 +283,13 @@ if __name__ == '__main__':
         num_attention_heads=4,
         dropout=0.5,
         use_gat=True,
-        ligand_dim=40  # LigandFeatures.LIGAND_FEAT_DIM
+        ligand_dim=36,  # LigandFeatures.LIGAND_FEAT_DIM
+        esm_dim=1280,
+        esm_compress_dim=64  # Varianta C: ESM 1280 → 64 v grafu
     )
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  ESM compressor:     {sum(p.numel() for p in model.esm_compressor.parameters()):,}")
     print(f"  Protein projection: {sum(p.numel() for p in model.protein_projection.parameters()):,}")
     print(f"  Ligand projection:  {sum(p.numel() for p in model.ligand_projection.parameters()):,}")
     print(f"  Node type emb:      {sum(p.numel() for p in model.node_type_embedding.parameters()):,}")
