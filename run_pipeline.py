@@ -108,6 +108,17 @@ def parse_args():
     parser.add_argument('--cluster-identity', type=float, default=0.4,
                         help='CD-HIT sequence identity threshold for '
                              'cluster-based split (default: 0.4 = superfamily)')
+    parser.add_argument('--save-splits', type=str, default=None,
+                        help='Cesta ke složce, kam se uloží rozdělené datasety '
+                             '(train/val/test). Pokud není zadáno, splity se '
+                             'neukládají.')
+    parser.add_argument('--prepare-only', action='store_true',
+                        help='Pouze připraví datasety a uloží splity '
+                             '(bez tréninku). Vyžaduje --save-splits.')
+    parser.add_argument('--load-splits', type=str, default=None,
+                        help='Cesta ke složce s dříve uloženými splity. '
+                             'Přeskočí clusterování a použije existující '
+                             'train/val/test rozdělení.')
     return parser.parse_args()
 
 
@@ -415,6 +426,161 @@ def load_sequence_data(config):
 # ============================================================
 # KROK 5: TRÉNINK
 # ============================================================
+def save_splits(output_dir, train_data, val_data, test_data, 
+                split_type='graph', config=None):
+    """
+    Uloží rozdělené datasety na disk.
+    
+    Args:
+        output_dir: cílová složka
+        train_data: train split (list of PyG Data nebo Subset)
+        val_data: val split
+        test_data: test split
+        split_type: 'graph' nebo 'sequence'
+        config: konfigurace (pro metadata)
+    """
+    split_dir = os.path.join(output_dir, split_type)
+    os.makedirs(split_dir, exist_ok=True)
+    
+    splits = {'train': train_data, 'val': val_data, 'test': test_data}
+    
+    for name, data in splits.items():
+        if data is None or len(data) == 0:
+            print(f"  ℹ {split_type}/{name} je prázdný – přeskakuji")
+            continue
+        
+        save_path = os.path.join(split_dir, f'{name}.pt')
+        
+        if split_type == 'graph':
+            # PyG Data list
+            torch.save(data, save_path)
+        else:
+            # Sequence Subset → uložíme indexy + metadata
+            if hasattr(data, 'indices'):
+                # torch.utils.data.Subset
+                torch.save({
+                    'indices': data.indices,
+                    'sequences': [data.dataset.sequences[i] for i in data.indices],
+                    'labels': [data.dataset.labels[i] for i in data.indices],
+                }, save_path)
+            else:
+                torch.save(data, save_path)
+        
+        print(f"  ✓ Uloženo {len(data)} vzorků do {save_path}")
+    
+    # Metadata
+    metadata = {
+        'split_type': split_type,
+        'n_train': len(train_data) if train_data else 0,
+        'n_val': len(val_data) if val_data else 0,
+        'n_test': len(test_data) if test_data else 0,
+        'cluster_identity': config.get('cluster_identity', 0.4) if config else 0.4,
+        'ligand': config.get('ligand_name', 'NAD') if config else 'NAD',
+    }
+    metadata_path = os.path.join(split_dir, 'split_metadata.pt')
+    torch.save(metadata, metadata_path)
+    print(f"  ✓ Metadata uložena do {metadata_path}")
+
+
+def load_splits(input_dir, split_type='graph'):
+    """
+    Načte dříve uložené splity z disku.
+    
+    Args:
+        input_dir: složka se splity (obsahuje graph/ a/nebo sequence/)
+        split_type: 'graph' nebo 'sequence'
+    
+    Returns:
+        (train_data, val_data, test_data, metadata) nebo None pokud neexistuje
+    """
+    split_dir = os.path.join(input_dir, split_type)
+    
+    if not os.path.isdir(split_dir):
+        print(f"  ⚠ Složka {split_dir} neexistuje")
+        return None
+    
+    # Metadata
+    metadata_path = os.path.join(split_dir, 'split_metadata.pt')
+    metadata = None
+    if os.path.exists(metadata_path):
+        metadata = torch.load(metadata_path, weights_only=False)
+        print(f"  ℹ Split metadata: {metadata}")
+    
+    splits = {}
+    for name in ['train', 'val', 'test']:
+        save_path = os.path.join(split_dir, f'{name}.pt')
+        if os.path.exists(save_path):
+            splits[name] = torch.load(save_path, weights_only=False)
+            n = len(splits[name]) if not isinstance(splits[name], dict) else len(splits[name].get('sequences', []))
+            print(f"  ✓ Načteno {n} vzorků z {save_path}")
+        else:
+            splits[name] = []
+            print(f"  ℹ {save_path} nenalezen – prázdný split")
+    
+    return splits.get('train', []), splits.get('val', []), splits.get('test', []), metadata
+
+
+def _build_seq_subsets_from_loaded(loaded_splits, esm_extractor=None, 
+                                    esm_model_name=None, cache_dir=None,
+                                    max_length=512):
+    """
+    Vytvoří SequenceDataset Subsety z načtených sekvenčních splitů.
+    
+    Každý split je dict s 'sequences' a 'labels' → vytvoří se
+    samostatný SequenceDataset pro train/val/test.
+    
+    Returns:
+        (train_dataset, val_dataset, test_dataset)
+    """
+    from sequence_dataset import SequenceDataset, save_embeddings, load_embeddings
+    
+    train_data, val_data, test_data = loaded_splits[:3]
+    datasets = []
+    
+    for name, data in [('train', train_data), ('val', val_data), ('test', test_data)]:
+        if isinstance(data, dict) and 'sequences' in data:
+            seqs = data['sequences']
+            labs = data['labels']
+        elif isinstance(data, list) and len(data) > 0:
+            # Fallback: pokud data jsou list
+            seqs = [d.get('sequence', '') if isinstance(d, dict) else '' for d in data]
+            labs = [d.get('label', 0) if isinstance(d, dict) else 0 for d in data]
+        else:
+            datasets.append(None)
+            continue
+        
+        if len(seqs) == 0:
+            datasets.append(None)
+            continue
+        
+        # Zkus cache pro embeddingy
+        precomputed = None
+        if cache_dir:
+            emb_cache = os.path.join(cache_dir, f'seq_embeddings_{name}_split.npz')
+            if os.path.exists(emb_cache):
+                precomputed = load_embeddings(emb_cache)
+                if len(precomputed) != len(seqs):
+                    precomputed = None
+        
+        if precomputed and len(precomputed) == len(seqs):
+            ds = SequenceDataset(seqs, labs, precomputed_embeddings=precomputed,
+                               max_length=max_length)
+        else:
+            if esm_extractor is None and esm_model_name:
+                from esm2_feature_ex import ESMFeatureExtractor
+                esm_extractor = ESMFeatureExtractor(model_name=esm_model_name)
+            ds = SequenceDataset(seqs, labs, esm_extractor=esm_extractor,
+                               max_length=max_length)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+                emb_cache = os.path.join(cache_dir, f'seq_embeddings_{name}_split.npz')
+                save_embeddings(ds.precomputed, emb_cache)
+        
+        datasets.append(ds)
+    
+    return tuple(datasets)
+
+
 def train_dual(config, graph_dataset, seq_dataset=None):
     """Spustí dual-branch trénink."""
     from dual_predictor import DualBranchPredictor
@@ -427,8 +593,24 @@ def train_dual(config, graph_dataset, seq_dataset=None):
     device = config['device']
     print(f"  Device: {device}")
     
-    # ---- Graph data split (CLUSTER-BASED) ----
-    if len(graph_dataset) >= 5:
+    identity_threshold = config.get('cluster_identity', 0.4)
+    
+    # ---- Zkus načíst existující splity ----
+    loaded_graph_splits = None
+    loaded_seq_splits = None
+    
+    if config.get('load_splits_dir'):
+        print(f"  Načítám splity z: {config['load_splits_dir']}")
+        loaded_graph_splits = load_splits(config['load_splits_dir'], 'graph')
+        loaded_seq_splits = load_splits(config['load_splits_dir'], 'sequence')
+    
+    # ---- Graph data split ----
+    if loaded_graph_splits is not None:
+        train_graphs, val_graphs, test_graphs, meta = loaded_graph_splits
+        print(f"  ✓ Načtené graph splity: "
+              f"{len(train_graphs)} train, {len(val_graphs)} val, "
+              f"{len(test_graphs)} test")
+    elif len(graph_dataset) >= 5:
         # Extrahuj sekvence a labely z datasetu
         sequences = []
         labels = []
@@ -450,10 +632,44 @@ def train_dual(config, graph_dataset, seq_dataset=None):
               f"{len(train_graphs)} train, {len(val_graphs)} val, "
               f"{len(test_graphs)} test "
               f"(identity threshold: {identity_threshold})")
+        
+        # Ulož splity pokud je požadováno
+        if config.get('save_splits_dir'):
+            save_splits(config['save_splits_dir'], 
+                       train_graphs, val_graphs, test_graphs,
+                       split_type='graph', config=config)
     else:
         train_graphs = graph_dataset.graphs
         val_graphs = graph_dataset.graphs
         test_graphs = []
+    
+    # Pokud je prepare-only, netrénujeme
+    if config.get('prepare_only'):
+        if seq_dataset is not None and len(seq_dataset) > 0:
+            # Ještě musíme zpracovat sekvenční split
+            from sequence_clustering import cluster_and_split_sequences
+            
+            seq_sequences = [seq_dataset.sequences[i] for i in range(len(seq_dataset))]
+            seq_labels = [seq_dataset.labels[i] for i in range(len(seq_dataset))]
+            
+            seq_train, seq_val, seq_test = cluster_and_split_sequences(
+                seq_dataset, seq_sequences, seq_labels,
+                identity_threshold=identity_threshold,
+                val_size=0.15,
+                test_size=0.15,
+                random_state=42
+            )
+            
+            print(f"  Sekvence: {len(seq_train)} train, {len(seq_val)} val, "
+                  f"{len(seq_test)} test")
+            
+            if config.get('save_splits_dir'):
+                save_splits(config['save_splits_dir'],
+                           seq_train, seq_val, seq_test,
+                           split_type='sequence', config=config)
+        
+        print("\n  ✓ Prepare-only režim – datasety připraveny, trénink přeskočen.")
+        return None
     
     graph_train_loader = PyGDataLoader(
         train_graphs, batch_size=config['batch_size_graph'], shuffle=True
@@ -464,11 +680,36 @@ def train_dual(config, graph_dataset, seq_dataset=None):
     
     print(f"  Grafy: {len(train_graphs)} train, {len(val_graphs)} val")
     
-    # ---- Sequence data split (CLUSTER-BASED) ----
+    # ---- Sequence data split ----
     seq_train_loader = None
     seq_val_loader = None
     
-    if seq_dataset is not None and len(seq_dataset) > 0:
+    if loaded_seq_splits is not None:
+        # Načtené sekvenční splity
+        seq_train_ds, seq_val_ds, seq_test_ds = _build_seq_subsets_from_loaded(
+            loaded_seq_splits,
+            esm_model_name=config['esm_model'],
+            cache_dir=config['cache_dir'],
+            max_length=512
+        )
+        
+        if seq_train_ds is not None:
+            seq_train_loader = DataLoader(
+                seq_train_ds, batch_size=config['batch_size_seq'],
+                shuffle=True, collate_fn=collate_sequences
+            )
+        if seq_val_ds is not None:
+            seq_val_loader = DataLoader(
+                seq_val_ds, batch_size=config['batch_size_seq'],
+                collate_fn=collate_sequences
+            )
+        
+        n_train = len(seq_train_ds) if seq_train_ds else 0
+        n_val = len(seq_val_ds) if seq_val_ds else 0
+        n_test = len(seq_test_ds) if seq_test_ds else 0
+        print(f"  Sekvence (načtené): {n_train} train, {n_val} val, {n_test} test")
+    
+    elif seq_dataset is not None and len(seq_dataset) > 0:
         from sequence_clustering import cluster_and_split_sequences
         
         seq_sequences = [seq_dataset.sequences[i] for i in range(len(seq_dataset))]
@@ -493,6 +734,12 @@ def train_dual(config, graph_dataset, seq_dataset=None):
         
         print(f"  Sekvence: {len(seq_train)} train, {len(seq_val)} val, "
               f"{len(seq_test)} test")
+        
+        # Ulož sekvenční splity pokud je požadováno
+        if config.get('save_splits_dir'):
+            save_splits(config['save_splits_dir'],
+                       seq_train, seq_val, seq_test,
+                       split_type='sequence', config=config)
     
     # ---- Model ----
     model = DualBranchPredictor(
@@ -537,7 +784,18 @@ def train_gnn_only(config, graph_dataset):
     
     device = config['device']
     
-    if len(graph_dataset) >= 5:
+    # ---- Zkus načíst existující splity ----
+    loaded_graph_splits = None
+    if config.get('load_splits_dir'):
+        print(f"  Načítám splity z: {config['load_splits_dir']}")
+        loaded_graph_splits = load_splits(config['load_splits_dir'], 'graph')
+    
+    if loaded_graph_splits is not None:
+        train_graphs, val_graphs, test_graphs, meta = loaded_graph_splits
+        print(f"  ✓ Načtené graph splity: "
+              f"{len(train_graphs)} train, {len(val_graphs)} val, "
+              f"{len(test_graphs)} test")
+    elif len(graph_dataset) >= 5:
         # Extrahuj sekvence a labely z datasetu
         sequences = []
         labels = []
@@ -559,11 +817,22 @@ def train_gnn_only(config, graph_dataset):
         print(f"  ✓ Cluster-based split: "
               f"{len(train_graphs)} train, {len(val_graphs)} val, "
               f"{len(test_graphs)} test")
+        
+        # Ulož splity pokud je požadováno
+        if config.get('save_splits_dir'):
+            save_splits(config['save_splits_dir'],
+                       train_graphs, val_graphs, test_graphs,
+                       split_type='graph', config=config)
     else:
         train_graphs = (graph_dataset.graphs if hasattr(graph_dataset, 'graphs') 
                        else list(graph_dataset))
         val_graphs = train_graphs
         test_graphs = []
+    
+    # Pokud je prepare-only, netrénujeme
+    if config.get('prepare_only'):
+        print("\n  ✓ Prepare-only režim – datasety připraveny, trénink přeskočen.")
+        return None
     
     train_loader = PyGDataLoader(
         train_graphs, batch_size=config['batch_size_graph'], shuffle=True
@@ -777,6 +1046,17 @@ def main():
     config['ligand_name'] = args.ligand
     config['esm_model'] = args.esm_model
     config['cluster_identity'] = args.cluster_identity
+    
+    # Save splits / prepare-only
+    if args.save_splits:
+        config['save_splits_dir'] = args.save_splits
+    if args.prepare_only:
+        if not args.save_splits:
+            print("❌ --prepare-only vyžaduje --save-splits <cesta>")
+            return
+        config['prepare_only'] = True
+    if args.load_splits:
+        config['load_splits_dir'] = args.load_splits
     
     # Nastav cesty dynamicky podle kofaktoru
     if args.test_data:

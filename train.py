@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, f1_score, average_precision_score
+import numpy as np
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -94,11 +96,22 @@ class Trainer:
         avg_loss = total_loss / total
         accuracy = correct / total
         
-        # AUC
-        from sklearn.metrics import roc_auc_score
-        auc = roc_auc_score(all_labels, all_preds)
+        all_labels = np.array(all_labels)
+        all_preds = np.array(all_preds)
+        pred_classes = (all_preds >= 0.5).astype(int)
         
-        return avg_loss, accuracy, auc
+        # AUC
+        if len(set(all_labels)) > 1:
+            auc = roc_auc_score(all_labels, all_preds)
+            ap = average_precision_score(all_labels, all_preds)
+        else:
+            auc = 0.0
+            ap = 0.0
+        
+        # F1 score
+        f1 = f1_score(all_labels, pred_classes, zero_division=0)
+        
+        return avg_loss, accuracy, auc, f1, ap
     
     def train(self, num_epochs=100):
         best_auc = 0
@@ -108,7 +121,7 @@ class Trainer:
             train_loss, train_acc = self.train_epoch()
             
             # Validate
-            val_loss, val_acc, val_auc = self.validate()
+            val_loss, val_acc, val_auc, val_f1, val_ap = self.validate()
             
             # LR scheduling
             self.scheduler.step(val_auc)
@@ -116,7 +129,8 @@ class Trainer:
             # Logging
             print(f"Epoch {epoch+1}/{num_epochs}")
             print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
-            print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
+            print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, "
+                  f"AUC: {val_auc:.4f}, F1: {val_f1:.4f}, AP: {val_ap:.4f}")
             
             # Save best model
             if val_auc > best_auc:

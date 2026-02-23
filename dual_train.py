@@ -20,7 +20,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from torch_geometric.loader import DataLoader as PyGDataLoader
 import numpy as np
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, f1_score, average_precision_score
 
 from sequence_dataset import collate_sequences
 
@@ -292,18 +292,27 @@ class DualTrainer:
                     all_labels.extend(labels.cpu().numpy())
         
         if total == 0:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0
         
         avg_loss = total_loss / total
         accuracy = correct / total
         
+        all_labels = np.array(all_labels)
+        all_preds = np.array(all_preds)
+        pred_classes = (all_preds >= 0.5).astype(int)
+        
         # AUC (potřebuje obě třídy)
         if len(set(all_labels)) > 1:
             auc = roc_auc_score(all_labels, all_preds)
+            ap = average_precision_score(all_labels, all_preds)
         else:
             auc = 0.0
+            ap = 0.0
         
-        return avg_loss, accuracy, auc
+        # F1 score
+        f1 = f1_score(all_labels, pred_classes, zero_division=0)
+        
+        return avg_loss, accuracy, auc, f1, ap
     
     def validate_per_branch(self):
         """
@@ -324,10 +333,17 @@ class DualTrainer:
                     preds.extend(probs.cpu().numpy())
                     labels.extend(batch.y.cpu().numpy())
                 
+                labels_arr = np.array(labels)
+                preds_arr = np.array(preds)
+                pred_classes = (preds_arr >= 0.5).astype(int)
+                
                 if len(set(labels)) > 1:
-                    results['gnn_auc'] = roc_auc_score(labels, preds)
+                    results['gnn_auc'] = roc_auc_score(labels_arr, preds_arr)
+                    results['gnn_ap'] = average_precision_score(labels_arr, preds_arr)
                 else:
                     results['gnn_auc'] = 0.0
+                    results['gnn_ap'] = 0.0
+                results['gnn_f1'] = f1_score(labels_arr, pred_classes, zero_division=0)
                 results['gnn_n'] = len(labels)
             
             # Sequence branch
@@ -347,10 +363,17 @@ class DualTrainer:
                     preds.extend(probs.cpu().numpy())
                     labels.extend(lab.cpu().numpy())
                 
+                labels_arr = np.array(labels)
+                preds_arr = np.array(preds)
+                pred_classes = (preds_arr >= 0.5).astype(int)
+                
                 if len(set(labels)) > 1:
-                    results['seq_auc'] = roc_auc_score(labels, preds)
+                    results['seq_auc'] = roc_auc_score(labels_arr, preds_arr)
+                    results['seq_ap'] = average_precision_score(labels_arr, preds_arr)
                 else:
                     results['seq_auc'] = 0.0
+                    results['seq_ap'] = 0.0
+                results['seq_f1'] = f1_score(labels_arr, pred_classes, zero_division=0)
                 results['seq_n'] = len(labels)
         
         return results
@@ -375,7 +398,7 @@ class DualTrainer:
                 consistency = self.train_epoch_with_consistency(both_loader)
             
             # ---- Validate ----
-            val_loss, val_acc, val_auc = self.validate()
+            val_loss, val_acc, val_auc, val_f1, val_ap = self.validate()
             
             # Per-branch metrics
             branch_metrics = self.validate_per_branch()
@@ -391,12 +414,16 @@ class DualTrainer:
             if consistency > 0:
                 print(f"    Consistency loss: {consistency:.4f}")
             print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, "
-                  f"AUC: {val_auc:.4f}")
+                  f"AUC: {val_auc:.4f}, F1: {val_f1:.4f}, AP: {val_ap:.4f}")
             if 'gnn_auc' in branch_metrics:
-                print(f"    GNN branch AUC:  {branch_metrics['gnn_auc']:.4f} "
+                print(f"    GNN branch AUC:  {branch_metrics['gnn_auc']:.4f}, "
+                      f"F1: {branch_metrics['gnn_f1']:.4f}, "
+                      f"AP: {branch_metrics['gnn_ap']:.4f} "
                       f"(n={branch_metrics['gnn_n']})")
             if 'seq_auc' in branch_metrics:
-                print(f"    Seq branch AUC:  {branch_metrics['seq_auc']:.4f} "
+                print(f"    Seq branch AUC:  {branch_metrics['seq_auc']:.4f}, "
+                      f"F1: {branch_metrics['seq_f1']:.4f}, "
+                      f"AP: {branch_metrics['seq_ap']:.4f} "
                       f"(n={branch_metrics['seq_n']})")
             
             # Save best model
