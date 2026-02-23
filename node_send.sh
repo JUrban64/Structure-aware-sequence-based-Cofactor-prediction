@@ -1,19 +1,19 @@
 #!/bin/bash
-#PBS -N TRAIN_SQ_test_8
+#PBS -N TRAIN_SQ_test_9
 #PBS -l select=1:ncpus=2:ngpus=1:mem=70gb:scratch_ssd=70gb
-#PBS -l walltime=12:00:00
+#PBS -l walltime=20:00:00
 
 
 
 DATADIR=/auto/brno2/home/urbany/SeQbCoP/Structure-aware-sequence-based-Cofactor-prediction
 
 module add mambaforge
-mamba activate sqbcp_cpu
+mamba activate sqbcp_gpu
 
 source /storage/brno2/home/urbany/miniconda3/etc/profile.d/conda.sh
-conda activate sqbcp_cpu
+conda activate sqbcp_gpu
 
-source activate /storage/brno2/home/urbany/.conda/envs/sqbcp_cpu
+source activate /storage/brno2/home/urbany/.conda/envs/sqbcp_gpu
 
 cd $SCRATCHDIR 
 

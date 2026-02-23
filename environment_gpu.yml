@@ -1,6 +1,7 @@
 name: sqbcp_gpu
 channels:
   - pytorch
+  - nvidia       # <-- PŘIDÁNO: nutné pro stažení libcublas a dalších CUDA knihoven
   - pyg
   - conda-forge
   - defaults
@@ -12,8 +13,9 @@ dependencies:
   - scipy
   - scikit-learn
 
-  # PyTorch (CPU verze – pro GPU nahradit pytorch-cuda=12.1)
-  - pytorch-cuda=12.1
+  # PyTorch
+  - pytorch            # <-- PŘIDÁNO: samotný framework je stále nutný
+  - pytorch-cuda=12.1  # <-- PONECHÁNO: specifikace verze CUDA
   - torchvision
   - torchaudio            
 
