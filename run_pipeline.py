@@ -76,6 +76,12 @@ DEFAULT_CONFIG = {
     'lr': 0.001,
     'consistency_weight': 0.3,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    
+    # Cluster-based split (ochrana proti data leakage)
+    'cluster_identity': 0.4,  # CD-HIT identity threshold
+                               # 0.3 = fold-level (přísné)
+                               # 0.4 = superfamily-level (doporučené)
+                               # 0.5 = family-level
 }
 
 
@@ -99,6 +105,9 @@ def parse_args():
                              '(10 pozitivních + 5 negativních PDB a sekvencí)')
     parser.add_argument('--esm-model', type=str, 
                         default='facebook/esm2_t33_650M_UR50D')
+    parser.add_argument('--cluster-identity', type=float, default=0.4,
+                        help='CD-HIT sequence identity threshold for '
+                             'cluster-based split (default: 0.4 = superfamily)')
     return parser.parse_args()
 
 
@@ -413,18 +422,38 @@ def train_dual(config, graph_dataset, seq_dataset=None):
     from sequence_dataset import collate_sequences
     from torch.utils.data import DataLoader, Subset
     from torch_geometric.loader import DataLoader as PyGDataLoader
+    from sequence_clustering import ClusterSplitter, cluster_and_split_graphs
     
     device = config['device']
     print(f"  Device: {device}")
     
-    # ---- Graph data split ----
+    # ---- Graph data split (CLUSTER-BASED) ----
     if len(graph_dataset) >= 5:
-        train_graphs, val_graphs = train_test_split(
-            graph_dataset.graphs, test_size=0.2, random_state=42
+        # Extrahuj sekvence a labely z datasetu
+        sequences = []
+        labels = []
+        for g in graph_dataset.graphs:
+            sequences.append(g.sequence if hasattr(g, 'sequence') else '')
+            labels.append(g.y.item())
+        
+        identity_threshold = config.get('cluster_identity', 0.4)
+        
+        train_graphs, val_graphs, test_graphs = cluster_and_split_graphs(
+            graph_dataset, sequences, labels,
+            identity_threshold=identity_threshold,
+            val_size=0.15,
+            test_size=0.15,
+            random_state=42
         )
+        
+        print(f"  ✓ Cluster-based split: "
+              f"{len(train_graphs)} train, {len(val_graphs)} val, "
+              f"{len(test_graphs)} test "
+              f"(identity threshold: {identity_threshold})")
     else:
         train_graphs = graph_dataset.graphs
-        val_graphs = graph_dataset.graphs  # Malý dataset → stejná data
+        val_graphs = graph_dataset.graphs
+        test_graphs = []
     
     graph_train_loader = PyGDataLoader(
         train_graphs, batch_size=config['batch_size_graph'], shuffle=True
@@ -435,29 +464,35 @@ def train_dual(config, graph_dataset, seq_dataset=None):
     
     print(f"  Grafy: {len(train_graphs)} train, {len(val_graphs)} val")
     
-    # ---- Sequence data split ----
+    # ---- Sequence data split (CLUSTER-BASED) ----
     seq_train_loader = None
     seq_val_loader = None
     
     if seq_dataset is not None and len(seq_dataset) > 0:
-        indices = list(range(len(seq_dataset)))
-        train_idx, val_idx = train_test_split(
-            indices, test_size=0.2, random_state=42
+        from sequence_clustering import cluster_and_split_sequences
+        
+        seq_sequences = [seq_dataset.sequences[i] for i in range(len(seq_dataset))]
+        seq_labels = [seq_dataset.labels[i] for i in range(len(seq_dataset))]
+        
+        seq_train, seq_val, seq_test = cluster_and_split_sequences(
+            seq_dataset, seq_sequences, seq_labels,
+            identity_threshold=identity_threshold,
+            val_size=0.15,
+            test_size=0.15,
+            random_state=42
         )
         
         seq_train_loader = DataLoader(
-            Subset(seq_dataset, train_idx),
-            batch_size=config['batch_size_seq'],
-            shuffle=True,
-            collate_fn=collate_sequences
+            seq_train, batch_size=config['batch_size_seq'],
+            shuffle=True, collate_fn=collate_sequences
         )
         seq_val_loader = DataLoader(
-            Subset(seq_dataset, val_idx),
-            batch_size=config['batch_size_seq'],
+            seq_val, batch_size=config['batch_size_seq'],
             collate_fn=collate_sequences
         )
         
-        print(f"  Sekvence: {len(train_idx)} train, {len(val_idx)} val")
+        print(f"  Sekvence: {len(seq_train)} train, {len(seq_val)} val, "
+              f"{len(seq_test)} test")
     
     # ---- Model ----
     model = DualBranchPredictor(
@@ -498,16 +533,37 @@ def train_gnn_only(config, graph_dataset):
     from binding_site_predictor import BindingSiteNADPredictor
     from train import Trainer
     from torch_geometric.loader import DataLoader as PyGDataLoader
+    from sequence_clustering import cluster_and_split_graphs
     
     device = config['device']
     
     if len(graph_dataset) >= 5:
-        train_graphs, val_graphs = train_test_split(
-            graph_dataset.graphs, test_size=0.2, random_state=42
+        # Extrahuj sekvence a labely z datasetu
+        sequences = []
+        labels = []
+        for g in (graph_dataset.graphs if hasattr(graph_dataset, 'graphs') 
+                  else graph_dataset):
+            sequences.append(g.sequence if hasattr(g, 'sequence') else '')
+            labels.append(g.y.item())
+        
+        identity_threshold = config.get('cluster_identity', 0.4)
+        
+        train_graphs, val_graphs, test_graphs = cluster_and_split_graphs(
+            graph_dataset, sequences, labels,
+            identity_threshold=identity_threshold,
+            val_size=0.15,
+            test_size=0.15,
+            random_state=42
         )
+        
+        print(f"  ✓ Cluster-based split: "
+              f"{len(train_graphs)} train, {len(val_graphs)} val, "
+              f"{len(test_graphs)} test")
     else:
-        train_graphs = graph_dataset.graphs
-        val_graphs = graph_dataset.graphs
+        train_graphs = (graph_dataset.graphs if hasattr(graph_dataset, 'graphs') 
+                       else list(graph_dataset))
+        val_graphs = train_graphs
+        test_graphs = []
     
     train_loader = PyGDataLoader(
         train_graphs, batch_size=config['batch_size_graph'], shuffle=True
@@ -720,6 +776,7 @@ def main():
     config['lr'] = args.lr
     config['ligand_name'] = args.ligand
     config['esm_model'] = args.esm_model
+    config['cluster_identity'] = args.cluster_identity
     
     # Nastav cesty dynamicky podle kofaktoru
     if args.test_data:

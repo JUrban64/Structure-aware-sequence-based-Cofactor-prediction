@@ -4,6 +4,9 @@ channels:
   - pyg
   - conda-forge
   - defaults
+  - bioconda
+
+
 
 dependencies:
   - python=3.10
@@ -23,6 +26,9 @@ dependencies:
 
   # Bioinformatics
   - conda-forge::biopython
+
+  - cd-hit
+
 
   # pip-only packages
   - pip
