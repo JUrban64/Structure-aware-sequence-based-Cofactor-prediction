@@ -19,6 +19,9 @@ NODE_TYPE_LIGAND = 1
 INTERACTION_TYPES = ['hbond_candidate', 'hydrophobic', 'ionic', 'other']
 ITYPE_TO_IDX = {t: i for i, t in enumerate(INTERACTION_TYPES)}
 
+# Pevná dimenze edge features: [distance_norm, hbond, hydrophobic, ionic, other]
+EDGE_ATTR_DIM = 5
+
 
 class BindingSiteGraphDataset:
     """
@@ -112,19 +115,8 @@ class BindingSiteGraphDataset:
         
         n_total = n_prot + n_lig
         
-        # ---- Sloučení uzlů: pad na společnou dimenzi ----
-        # Protein a ligand mají RŮZNÉ dimenze features →
-        # uložíme je zvlášť a model je projektuje na hidden_dim
-        # přes separate input projections.
-        # 
-        # V PyG Data uložíme:
-        #   x_protein: [n_prot, protein_dim]  (1310D default)
-        #   x_ligand:  [n_lig, ligand_dim]    (36D)
-        # A pro GNN potřebujeme společný x → padujeme na max_dim.
-        
         max_dim = max(protein_dim, ligand_dim)
         
-        # Pad protein features (pokud by ligand byl větší – nepravděpodobné)
         if protein_dim < max_dim:
             prot_pad = np.zeros((n_prot, max_dim - protein_dim))
             protein_padded = np.concatenate([protein_features, prot_pad], axis=1)
@@ -132,11 +124,8 @@ class BindingSiteGraphDataset:
             protein_padded = protein_features
         
         if has_ligand:
-            # Pad ligand features (ligand_dim=36 << protein_dim=1310)
             lig_pad = np.zeros((n_lig, max_dim - ligand_dim))
             ligand_padded = np.concatenate([ligand_features, lig_pad], axis=1)
-            
-            # Sloučit do jednoho feature tensoru
             all_features = np.concatenate([protein_padded, ligand_padded], axis=0)
         else:
             all_features = protein_padded
@@ -149,34 +138,34 @@ class BindingSiteGraphDataset:
             node_type[n_prot:] = NODE_TYPE_LIGAND
         
         # ---- EDGES ----
+        # Všechny edge_attr mají PEVNOU dimenzi EDGE_ATTR_DIM = 5:
+        #   [distance_norm, hbond, hydrophobic, ionic, other]
         all_edges = []      # list of [src, dst]
         all_edge_types = [] # list of int
-        all_edge_attr = []  # list of [weight] or [interaction features]
+        all_edge_attr = []  # list of [EDGE_ATTR_DIM] float vectors
         
         # 1) P-P edges: z kontaktní mapy
         contact_map = bs_info['contact_map']
-        pp_edges, pp_attr = self._contact_map_to_edges(contact_map)
-        if pp_edges.numel() > 0:
-            n_pp = pp_edges.shape[1]
-            all_edges.append(pp_edges)
-            all_edge_types.extend([EDGE_TYPE_PP] * n_pp)
-            all_edge_attr.append(pp_attr)
+        n_cm = contact_map.shape[0]
+        for i in range(n_cm):
+            for j in range(n_cm):
+                if contact_map[i, j] > 0.5:
+                    all_edges.append([i, j])
+                    all_edge_types.append(EDGE_TYPE_PP)
+                    # P-P edge attr: [contact_weight, 0, 0, 0, 0]
+                    attr = [contact_map[i, j], 0.0, 0.0, 0.0, 0.0]
+                    all_edge_attr.append(attr)
         
         # 2) P-L edges: protein-ligand interakce
         if has_ligand:
             pl_contacts = bs_info.get('protein_ligand_contacts', [])
             if pl_contacts:
-                pl_src, pl_dst, pl_feat = [], [], []
                 for contact in pl_contacts:
                     prot_idx = contact['protein_idx']
                     lig_idx = contact['ligand_idx'] + n_prot  # offset!
                     
-                    # Bidirectional
-                    pl_src.extend([prot_idx, lig_idx])
-                    pl_dst.extend([lig_idx, prot_idx])
-                    
                     # Edge feature: distance (normalized) + interaction type
-                    dist_norm = contact['distance'] / 4.5  # normalized
+                    dist_norm = contact['distance'] / 4.5
                     itype_oh = [0.0] * len(INTERACTION_TYPES)
                     itype_idx = ITYPE_TO_IDX.get(
                         contact['interaction_type'], 
@@ -185,56 +174,45 @@ class BindingSiteGraphDataset:
                     itype_oh[itype_idx] = 1.0
                     
                     edge_feat = [dist_norm] + itype_oh  # [5]
-                    pl_feat.extend([edge_feat, edge_feat])  # bidi
-                
-                pl_edges = torch.LongTensor([pl_src, pl_dst])
-                all_edges.append(pl_edges)
-                all_edge_types.extend([EDGE_TYPE_PL] * len(pl_src))
-                
-                # Pad P-L edge attr na stejný dim jako P-P (1D → 5D)
-                pl_attr = torch.FloatTensor(pl_feat)
-                all_edge_attr.append(pl_attr)
+                    
+                    # Bidirectional
+                    all_edges.append([prot_idx, lig_idx])
+                    all_edge_types.append(EDGE_TYPE_PL)
+                    all_edge_attr.append(edge_feat)
+                    
+                    all_edges.append([lig_idx, prot_idx])
+                    all_edge_types.append(EDGE_TYPE_PL)
+                    all_edge_attr.append(edge_feat)
         
         # 3) L-L edges: kovalentní vazby uvnitř ligandu
         if has_ligand:
             lig_bonds = bs_info.get('ligand_bonds', [])
             if lig_bonds:
-                ll_src, ll_dst, ll_feat = [], [], []
                 for i, j, dist in lig_bonds:
-                    src = i + n_prot  # offset
+                    src = i + n_prot
                     dst = j + n_prot
-                    ll_src.extend([src, dst])
-                    ll_dst.extend([dst, src])
+                    # L-L edge attr: [bond_length_norm, 0, 0, 0, 0]
+                    bond_feat = [dist / 1.9, 0.0, 0.0, 0.0, 0.0]
                     
-                    bond_feat = [dist / 1.9]  # normalized bond length
-                    ll_feat.extend([bond_feat, bond_feat])
-                
-                ll_edges = torch.LongTensor([ll_src, ll_dst])
-                all_edges.append(ll_edges)
-                all_edge_types.extend([EDGE_TYPE_LL] * len(ll_src))
-                ll_attr = torch.FloatTensor(ll_feat)
-                all_edge_attr.append(ll_attr)
+                    all_edges.append([src, dst])
+                    all_edge_types.append(EDGE_TYPE_LL)
+                    all_edge_attr.append(bond_feat)
+                    
+                    all_edges.append([dst, src])
+                    all_edge_types.append(EDGE_TYPE_LL)
+                    all_edge_attr.append(bond_feat)
         
         # ---- Sloučení hran ----
         if all_edges:
-            edge_index = torch.cat(all_edges, dim=1)
+            edge_index = torch.LongTensor(all_edges).t().contiguous()
             edge_type = torch.LongTensor(all_edge_types)
-            
-            # Sjednoť edge_attr na společnou dimenzi (padování)
-            max_edge_dim = max(ea.shape[1] for ea in all_edge_attr)
-            padded_attrs = []
-            for ea in all_edge_attr:
-                if ea.shape[1] < max_edge_dim:
-                    pad = torch.zeros(ea.shape[0], max_edge_dim - ea.shape[1])
-                    ea = torch.cat([ea, pad], dim=1)
-                padded_attrs.append(ea)
-            edge_attr = torch.cat(padded_attrs, dim=0)
+            edge_attr = torch.FloatTensor(all_edge_attr)  # [E, 5] – vždy stejná dim
         else:
             # Fallback: fully connected protein-only
             edge_list = [[i, j] for i in range(n_prot) for j in range(n_prot)]
             edge_index = torch.LongTensor(edge_list).t().contiguous()
             edge_type = torch.zeros(len(edge_list), dtype=torch.long)
-            edge_attr = torch.ones(len(edge_list), 1)
+            edge_attr = torch.zeros(len(edge_list), EDGE_ATTR_DIM)
         
         # ---- Label ----
         y = torch.LongTensor([1])  # Default; run_pipeline přepíše
