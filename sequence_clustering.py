@@ -2,8 +2,11 @@
 """
 Clusterování proteinových sekvencí pro split bez data leakage.
 
-Používá CD-HIT pro shlukování sekvencí podle sekvenční identity.
+Používá MMseqs2 pro shlukování sekvencí podle sekvenční identity.
 Proteiny ve stejném klastru NIKDY nejsou rozděleny mezi train/val/test.
+
+MMseqs2 je 100–1000× rychlejší než CD-HIT a podporuje prahy identity
+až k ~0.0 (CD-HIT vyžaduje ≥ 0.4).
 
 Typické prahy sekvenční identity:
   - 30% → velmi přísný (fold-level), pro generalizaci na vzdálené homology
@@ -23,6 +26,7 @@ Nebo programově:
 
 import os
 import sys
+import shutil
 import subprocess
 import tempfile
 import numpy as np
@@ -33,19 +37,22 @@ from typing import List, Tuple, Dict, Optional
 
 class SequenceClusterer:
     """
-    Clusterování proteinových sekvencí pomocí CD-HIT.
+    Clusterování proteinových sekvencí pomocí MMseqs2.
     
-    CD-HIT shlukuje sekvence podle sekvenční identity:
+    MMseqs2 shlukuje sekvence podle sekvenční identity:
     - Každý cluster má jednu reprezentativní sekvenci
     - Všechny sekvence v clusteru mají ≥ threshold identitu k reprezentantovi
+    - 100–1000× rychlejší než CD-HIT
+    - Podporuje prahy identity < 0.4 (CD-HIT vyžaduje ≥ 0.4)
     
     Reference:
-        Li & Godzik (2006) Bioinformatics 22:1658-1659
-        Fu et al. (2012) Bioinformatics 28:3150-3152
+        Steinegger & Söding (2017) Nature Biotechnology 35:1026-1028
+        Steinegger & Söding (2018) Nature Communications 9:2116
     """
     
-    def __init__(self, identity_threshold=0.4, word_size=None, 
-                 cdhit_path='cd-hit', threads=4, memory=4000,
+    def __init__(self, identity_threshold=0.4,
+                 mmseqs_path='mmseqs', threads=4,
+                 sensitivity=7.5, coverage=0.8, cov_mode=0,
                  timeout=None):
         """
         Args:
@@ -53,44 +60,29 @@ class SequenceClusterer:
                 0.3 = fold-level (velmi přísné)
                 0.4 = superfamily-level (doporučené)
                 0.5 = family-level
-            word_size: word size pro CD-HIT (auto pokud None)
-                identity ≥ 0.7: word_size = 5
-                identity ≥ 0.6: word_size = 4
-                identity ≥ 0.5: word_size = 3
-                identity ≥ 0.4: word_size = 2
-            cdhit_path: cesta k CD-HIT binárce
+            mmseqs_path: cesta k MMseqs2 binárce
             threads: počet vláken
-            memory: paměť v MB
-            timeout: max čas pro CD-HIT v sekundách (None = auto dle počtu sekvencí)
+            sensitivity: citlivost vyhledávání (1.0-7.5, vyšší = citlivější)
+                Pro identity < 0.4 doporučen 7.5
+            coverage: minimální pokrytí sekvence (0.0-1.0)
+            cov_mode: režim pokrytí:
+                0 = pokrytí obou sekvencí (target + query)
+                1 = pokrytí target sekvence
+                2 = pokrytí query sekvence
+            timeout: max čas v sekundách (None = auto dle počtu sekvencí)
         """
         self.identity_threshold = identity_threshold
-        self.cdhit_path = cdhit_path
+        self.mmseqs_path = mmseqs_path
         self.threads = threads
-        self.memory = memory
+        self.sensitivity = sensitivity
+        self.coverage = coverage
+        self.cov_mode = cov_mode
         self.timeout = timeout
-        
-        # Auto word size podle CD-HIT dokumentace
-        if word_size is None:
-            if identity_threshold >= 0.7:
-                self.word_size = 5
-            elif identity_threshold >= 0.6:
-                self.word_size = 4
-            elif identity_threshold >= 0.5:
-                self.word_size = 3
-            elif identity_threshold >= 0.4:
-                self.word_size = 2
-            else:
-                raise ValueError(
-                    f"CD-HIT nepodporuje identitu < 0.4. "
-                    f"Pro nižší prahy použijte MMseqs2 nebo BLAST."
-                )
-        else:
-            self.word_size = word_size
     
     def cluster(self, sequences: List[str], 
                 ids: Optional[List[str]] = None) -> Dict[int, List[int]]:
         """
-        Clusteruje sekvence pomocí CD-HIT.
+        Clusteruje sekvence pomocí MMseqs2.
         
         Args:
             sequences: list sekvencí (AA stringy)
@@ -102,211 +94,140 @@ class SequenceClusterer:
         if ids is None:
             ids = [f"seq_{i}" for i in range(len(sequences))]
         
-        if not self._check_cdhit():
-            print("  ⚠ CD-HIT není nainstalován, používám fallback MMseqs2/BLAST")
+        if not self._check_mmseqs():
+            print("  ⚠ MMseqs2 není nainstalován, používám fallback "
+                  "(k-mer greedy clustering)")
             return self._fallback_clustering(sequences)
         
         # ---- Auto timeout: škáluje s počtem sekvencí ----
+        # MMseqs2 je mnohem rychlejší než CD-HIT, ale pro jistotu
         if self.timeout is None:
-            timeout = max(600, min(14400, len(sequences) * 2))
+            timeout = max(300, min(7200, len(sequences)))
         else:
             timeout = self.timeout
         
-        # ---- Pro velké datasety: dvoustupňový clustering ----
-        # Nejprve cluster na 90% (rychlé), pak na cílový threshold
-        use_two_stage = (len(sequences) > 5000 
-                         and self.identity_threshold < 0.7)
-        
-        if use_two_stage:
-            print(f"  Dvoustupňový CD-HIT: "
-                  f"{len(sequences)} sekvencí → 0.9 → {self.identity_threshold}")
-            clusters = self._two_stage_cdhit(sequences, ids, timeout)
-        else:
-            clusters = self._single_stage_cdhit(sequences, ids, timeout)
-        
-        return clusters
+        return self._run_mmseqs2(sequences, ids, timeout)
     
-    def _single_stage_cdhit(self, sequences, ids, timeout):
-        """Standardní jednofázový CD-HIT."""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', 
-                                          delete=False) as fasta_file:
-            for i, (seq_id, seq) in enumerate(zip(ids, sequences)):
-                fasta_file.write(f">{seq_id}__idx__{i}\n{seq}\n")
-            fasta_path = fasta_file.name
-        
-        output_path = fasta_path + '.cdhit'
+    def _run_mmseqs2(self, sequences, ids, timeout):
+        """Spustí MMseqs2 clustering."""
+        tmpdir = tempfile.mkdtemp(prefix='mmseqs_')
         
         try:
-            cmd = [
-                self.cdhit_path,
-                '-i', fasta_path,
-                '-o', output_path,
-                '-c', str(self.identity_threshold),
-                '-n', str(self.word_size),
-                '-M', str(self.memory),
-                '-T', str(self.threads),
-                '-d', '0',
+            # 1. Zapíšeme FASTA
+            fasta_path = os.path.join(tmpdir, 'input.fasta')
+            with open(fasta_path, 'w') as f:
+                for i, (seq_id, seq) in enumerate(zip(ids, sequences)):
+                    f.write(f">{seq_id}__idx__{i}\n{seq}\n")
+            
+            db_path = os.path.join(tmpdir, 'seqDB')
+            cluster_path = os.path.join(tmpdir, 'clusterDB')
+            tsv_path = os.path.join(tmpdir, 'clusters.tsv')
+            tmp_path = os.path.join(tmpdir, 'tmp')
+            os.makedirs(tmp_path, exist_ok=True)
+            
+            # 2. Vytvoř MMseqs2 databázi
+            cmd_createdb = [
+                self.mmseqs_path, 'createdb',
+                fasta_path, db_path,
             ]
-            
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout
-            )
-            
-            if result.returncode != 0:
-                print(f"  ⚠ CD-HIT chyba: {result.stderr[:200]}")
+            r = subprocess.run(cmd_createdb, capture_output=True, text=True,
+                               timeout=timeout)
+            if r.returncode != 0:
+                print(f"  ⚠ MMseqs2 createdb chyba: {r.stderr[:300]}")
                 return self._fallback_clustering(sequences)
             
-            clusters = self._parse_cdhit_output(output_path + '.clstr')
+            # 3. Clusterování
+            cmd_cluster = [
+                self.mmseqs_path, 'cluster',
+                db_path, cluster_path, tmp_path,
+                '--min-seq-id', str(self.identity_threshold),
+                '-c', str(self.coverage),
+                '--cov-mode', str(self.cov_mode),
+                '-s', str(self.sensitivity),
+                '--threads', str(self.threads),
+                '--cluster-mode', '0',  # greedy set cover (jako CD-HIT)
+            ]
+            r = subprocess.run(cmd_cluster, capture_output=True, text=True,
+                               timeout=timeout)
+            if r.returncode != 0:
+                print(f"  ⚠ MMseqs2 cluster chyba: {r.stderr[:300]}")
+                return self._fallback_clustering(sequences)
+            
+            # 4. Exportuj výsledky do TSV
+            cmd_tsv = [
+                self.mmseqs_path, 'createtsv',
+                db_path, db_path, cluster_path, tsv_path,
+            ]
+            r = subprocess.run(cmd_tsv, capture_output=True, text=True,
+                               timeout=timeout)
+            if r.returncode != 0:
+                print(f"  ⚠ MMseqs2 createtsv chyba: {r.stderr[:300]}")
+                return self._fallback_clustering(sequences)
+            
+            # 5. Parsuj TSV → clusters
+            clusters = self._parse_mmseqs2_tsv(tsv_path)
+            
             print(f"  ✓ {len(sequences)} sekvencí → {len(clusters)} clusterů "
-                  f"(CD-HIT, identity={self.identity_threshold})")
+                  f"(MMseqs2, identity={self.identity_threshold})")
             return clusters
         
         except subprocess.TimeoutExpired:
-            print(f"  ⚠ CD-HIT timeout po {timeout}s, "
+            print(f"  ⚠ MMseqs2 timeout po {timeout}s, "
                   f"přepínám na fallback clustering")
             return self._fallback_clustering(sequences)
         
         finally:
-            for f in [fasta_path, output_path, output_path + '.clstr']:
-                if os.path.exists(f):
-                    os.unlink(f)
+            shutil.rmtree(tmpdir, ignore_errors=True)
     
-    def _two_stage_cdhit(self, sequences, ids, timeout):
-        """
-        Dvoustupňový clustering pro velké datasety:
-        1. CD-HIT na 90% identity (velmi rychlé) → redukuje počet sekvencí
-        2. CD-HIT na cílový threshold (pomalejší, ale méně sekvencí)
-        """
-        # Stage 1: 90% identity
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', 
-                                          delete=False) as f1:
-            for i, (seq_id, seq) in enumerate(zip(ids, sequences)):
-                f1.write(f">{seq_id}__idx__{i}\n{seq}\n")
-            path1 = f1.name
-        
-        out1 = path1 + '.stage1'
-        
-        try:
-            # Stage 1
-            cmd1 = [
-                self.cdhit_path,
-                '-i', path1, '-o', out1,
-                '-c', '0.9', '-n', '5',
-                '-M', str(self.memory),
-                '-T', str(self.threads),
-                '-d', '0',
-            ]
-            r1 = subprocess.run(cmd1, capture_output=True, text=True, 
-                               timeout=timeout // 2)
-            
-            if r1.returncode != 0:
-                print(f"  ⚠ Stage 1 chyba, fallback")
-                return self._fallback_clustering(sequences)
-            
-            n_stage1 = sum(1 for line in open(out1) if line.startswith('>'))
-            print(f"    Stage 1: {len(sequences)} → {n_stage1} (90% identity)")
-            
-            # Stage 2: target identity na reprezentanty
-            out2 = out1 + '.stage2'
-            cmd2 = [
-                self.cdhit_path,
-                '-i', out1, '-o', out2,
-                '-c', str(self.identity_threshold),
-                '-n', str(self.word_size),
-                '-M', str(self.memory),
-                '-T', str(self.threads),
-                '-d', '0',
-            ]
-            r2 = subprocess.run(cmd2, capture_output=True, text=True, 
-                               timeout=timeout)
-            
-            if r2.returncode != 0:
-                print(f"  ⚠ Stage 2 chyba, fallback")
-                return self._fallback_clustering(sequences)
-            
-            # Parsuj stage 2 clustery (mají reprezentantové indexy)
-            stage2_clusters = self._parse_cdhit_output(out2 + '.clstr')
-            # Parsuj stage 1 clustery
-            stage1_clusters = self._parse_cdhit_output(out1 + '.clstr')
-            
-            # Zkombinuj: stage2 cluster → stage1 clustery → original indexy
-            final_clusters = {}
-            # stage1: {cluster_id: [original_indices]}
-            # stage2: {cluster_id: [stage1_representative_indices]}
-            # stage1 representative = první člen (index 0 v stage1 clusteru)
-            
-            # Mapuj stage1 repr → original indices
-            stage1_repr_to_members = {}
-            for cid, members in stage1_clusters.items():
-                repr_idx = members[0]  # representant
-                stage1_repr_to_members[repr_idx] = members
-            
-            for cid2, stage2_members in stage2_clusters.items():
-                final_members = []
-                for s1_repr in stage2_members:
-                    if s1_repr in stage1_repr_to_members:
-                        final_members.extend(stage1_repr_to_members[s1_repr])
-                    else:
-                        final_members.append(s1_repr)
-                final_clusters[cid2] = final_members
-            
-            print(f"    Stage 2: {n_stage1} → {len(final_clusters)} clusterů "
-                  f"(identity={self.identity_threshold})")
-            return final_clusters
-        
-        except subprocess.TimeoutExpired:
-            print(f"  ⚠ Two-stage CD-HIT timeout, fallback")
-            return self._fallback_clustering(sequences)
-        
-        finally:
-            for f in [path1, out1, out1 + '.clstr',
-                      out1 + '.stage2', out1 + '.stage2.clstr']:
-                if os.path.exists(f):
-                    os.unlink(f)
-
-    def _check_cdhit(self) -> bool:
-        """Zkontroluje, zda je CD-HIT dostupný."""
+    def _check_mmseqs(self) -> bool:
+        """Zkontroluje, zda je MMseqs2 dostupný."""
         try:
             result = subprocess.run(
-                [self.cdhit_path, '--help'], 
+                [self.mmseqs_path, 'version'],
                 capture_output=True, text=True, timeout=10
             )
-            return True
+            return result.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
     
-    def _parse_cdhit_output(self, clstr_file: str) -> Dict[int, List[int]]:
+    def _parse_mmseqs2_tsv(self, tsv_path: str) -> Dict[int, List[int]]:
         """
-        Parsuje .clstr soubor z CD-HIT.
+        Parsuje TSV výstup z MMseqs2 createtsv.
         
-        Formát:
-            >Cluster 0
-            0	292aa, >seq_5__idx__5... *
-            1	285aa, >seq_12__idx__12... at 85.26%
-            >Cluster 1
+        Formát (tabulátor):
+            representative_id\tmember_id
+            seq_0__idx__0\tseq_0__idx__0
+            seq_0__idx__0\tseq_3__idx__3
+            seq_1__idx__1\tseq_1__idx__1
             ...
         
         Returns:
             clusters: {cluster_id: [original_seq_indices]}
         """
-        clusters = {}
-        current_cluster = -1
+        repr_to_members = defaultdict(list)
         
-        with open(clstr_file, 'r') as f:
+        with open(tsv_path, 'r') as f:
             for line in f:
                 line = line.strip()
-                if line.startswith('>Cluster'):
-                    current_cluster = int(line.split()[-1])
-                    clusters[current_cluster] = []
-                elif line and current_cluster >= 0:
-                    # Extrahuj index z "__idx__N"
-                    try:
-                        # Formát: "0  292aa, >seq_5__idx__5... *"
-                        name_part = line.split('>')[1].split('...')[0]
-                        idx = int(name_part.split('__idx__')[1])
-                        clusters[current_cluster].append(idx)
-                    except (IndexError, ValueError):
-                        continue
+                if not line:
+                    continue
+                parts = line.split('\t')
+                if len(parts) < 2:
+                    continue
+                repr_name = parts[0]
+                member_name = parts[1]
+                
+                # Extrahuj index z "__idx__N"
+                try:
+                    member_idx = int(member_name.split('__idx__')[1])
+                    repr_to_members[repr_name].append(member_idx)
+                except (IndexError, ValueError):
+                    continue
+        
+        # Přečísluj clustery na 0, 1, 2, ...
+        clusters = {}
+        for cluster_id, (_, members) in enumerate(repr_to_members.items()):
+            clusters[cluster_id] = members
         
         return clusters
     
@@ -315,18 +236,20 @@ class SequenceClusterer:
         Fallback: jednoduchý greedy clustering bez externích nástrojů.
         Pomalejší, ale funguje vždy.
         
-        Počítá Hamming-like similaritu na alignovaných sekvencích 
-        (jen pro podobně dlouhé). Pro krátké datasety dostačující.
+        Počítá k-mer overlap jako proxy pro sekvenční identitu.
+        Pro krátké datasety dostačující.
         """
-        print("  ⚠ Fallback: greedy identity clustering (pomalé pro >1000 sekvencí)")
+        print("  ⚠ Fallback: greedy k-mer clustering "
+              "(pomalé pro >1000 sekvencí)")
         
         n = len(sequences)
         assigned = [False] * n
         clusters = {}
         cluster_id = 0
         
-        # Seřaď podle délky (delší = reprezentanti, jako CD-HIT)
-        order = sorted(range(n), key=lambda i: len(sequences[i]), reverse=True)
+        # Seřaď podle délky (delší = reprezentanti, jako MMseqs2)
+        order = sorted(range(n), key=lambda i: len(sequences[i]),
+                        reverse=True)
         
         for rep_idx in order:
             if assigned[rep_idx]:
@@ -343,7 +266,8 @@ class SequenceClusterer:
                 other_seq = sequences[other_idx]
                 
                 # Rychlý pre-filter: délky musí být podobné
-                len_ratio = min(len(rep_seq), len(other_seq)) / max(len(rep_seq), len(other_seq))
+                len_ratio = (min(len(rep_seq), len(other_seq))
+                             / max(len(rep_seq), len(other_seq)))
                 if len_ratio < self.identity_threshold:
                     continue
                 
@@ -395,17 +319,16 @@ class ClusterSplitter:
     
     def __init__(self, identity_threshold=0.4, 
                  val_size=0.15, test_size=0.15,
-                 random_state=42, cdhit_path='cd-hit'):
+                 random_state=42):
         """
         Args:
-            identity_threshold: práh pro CD-HIT clusterování
+            identity_threshold: práh pro MMseqs2 clusterování
             val_size: podíl validačních dat (0.15 = 15%)
             test_size: podíl testovacích dat (0.15 = 15%)
             random_state: random seed pro reprodukovatelnost
         """
         self.clusterer = SequenceClusterer(
             identity_threshold=identity_threshold,
-            cdhit_path=cdhit_path
         )
         self.val_size = val_size
         self.test_size = test_size
@@ -652,7 +575,7 @@ def cluster_and_split_graphs(graph_dataset, sequences, labels,
         graph_dataset: BindingSiteGraphDataset
         sequences: list of full sequences (z binding_sites)
         labels: list of labels
-        identity_threshold: CD-HIT identity threshold
+        identity_threshold: MMseqs2 identity threshold
         val_size, test_size: podíly
         random_state: seed
     
@@ -720,7 +643,7 @@ if __name__ == '__main__':
         description='Cluster sequences and split for training')
     parser.add_argument('--fasta', type=str, help='Input FASTA file')
     parser.add_argument('--identity', type=float, default=0.4,
-                        help='CD-HIT identity threshold (default: 0.4)')
+                        help='MMseqs2 identity threshold (default: 0.4)')
     parser.add_argument('--val-size', type=float, default=0.15)
     parser.add_argument('--test-size', type=float, default=0.15)
     parser.add_argument('--seed', type=int, default=42)
@@ -774,7 +697,7 @@ if __name__ == '__main__':
         demo_labels = [1, 1, 0, 0, 0]
         
         splitter = ClusterSplitter(identity_threshold=0.4)
-        # Použije fallback (bez CD-HIT)
+        # Použije fallback (bez MMseqs2)
         train, val, test = splitter.split(demo_sequences, demo_labels)
         
         print(f"\nTrain: {train}")

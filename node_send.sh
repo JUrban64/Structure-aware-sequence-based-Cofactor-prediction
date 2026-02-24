@@ -1,7 +1,7 @@
 #!/bin/bash
-#PBS -N TRAIN_SQ_test_9
-#PBS -l select=1:ncpus=2:ngpus=1:mem=70gb:scratch_ssd=70gb
-#PBS -l walltime=20:00:00
+#PBS -N TRAIN_SQ_test_12
+#PBS -l select=1:ncpus=4:ngpus=1:mem=160gb:scratch_ssd=70gb
+#PBS -l walltime=05:00:00
 
 
 
@@ -17,16 +17,20 @@ source activate /storage/brno2/home/urbany/.conda/envs/sqbcp_gpu
 
 cd $SCRATCHDIR 
 
+mkdir splits
+
 
 
 cp $DATADIR/*.py $SCRATCHDIR 
 cp -r $DATADIR/data $SCRATCHDIR 
 
 
-python3 run_pipeline.py
+python3 run_pipeline.py --batch-size 16 --epochs 50 --save-splits splits/
 
 
 
+
+cp -r splits/ $DATADIR/
 cp *.pth $DATADIR/
 
 

@@ -26,7 +26,8 @@ dependencies:
   # Bioinformatics
   - conda-forge::biopython
 
-  - cd-hit
+  - bioconda::mmseqs2
+  - mmseqs2
 
   # pip-only packages
   - pip

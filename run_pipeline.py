@@ -78,12 +78,11 @@ DEFAULT_CONFIG = {
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     
     # Cluster-based split (ochrana proti data leakage)
-    'cluster_identity': 0.4,  # CD-HIT identity threshold
+    'cluster_identity': 0.4,  # MMseqs2 identity threshold
                                # 0.3 = fold-level (přísné)
                                # 0.4 = superfamily-level (doporučené)
                                # 0.5 = family-level
-    'cdhit_threads': 4,      # CD-HIT threads (zvyšte na ncpus z PBS)
-    'cdhit_memory': 4000,    # CD-HIT memory (MB)
+    'mmseqs_threads': 4,       # MMseqs2 threads (zvyšte na ncpus z PBS)
 }
 
 
@@ -108,7 +107,7 @@ def parse_args():
     parser.add_argument('--esm-model', type=str, 
                         default='facebook/esm2_t33_650M_UR50D')
     parser.add_argument('--cluster-identity', type=float, default=0.4,
-                        help='CD-HIT sequence identity threshold for '
+                        help='MMseqs2 sequence identity threshold for '
                              'cluster-based split (default: 0.4 = superfamily)')
     parser.add_argument('--save-splits', type=str, default=None,
                         help='Cesta ke složce, kam se uloží rozdělené datasety '

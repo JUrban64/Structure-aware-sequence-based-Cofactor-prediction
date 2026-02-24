@@ -56,7 +56,7 @@ Interleaved batches from both branches. Optional consistency loss aligns GNN and
 
 **Metrics:** AUC, F1 score, Average Precision (per-branch and combined).
 
-**Data split:** Cluster-based (CD-HIT, default 40% identity) to prevent data leakage between train/val/test.
+**Data split:** Cluster-based (MMseqs2, default 40% identity) to prevent data leakage between train/val/test.
 
 ---
 
@@ -145,7 +145,7 @@ esm2_feature_ex.py          ESM-2 embedding extraction
 additional_features.py      BLOSUM62, physicochemical, positional + ligand features
 binding_site_graph.py       PyG graph construction (heterogeneous P-L graph)
 sequence_dataset.py         Sequence-only dataset + ESM cache
-sequence_clustering.py      CD-HIT clustering + cluster-based train/val/test split
+sequence_clustering.py      MMseqs2 clustering + cluster-based train/val/test split
 download_data.py            RCSB PDB + UniProt download utilities
 dual_predictor.py           Dual-branch model (GNNBranch + SequenceBranch)
 dual_train.py               Dual-branch trainer
