@@ -82,6 +82,8 @@ DEFAULT_CONFIG = {
                                # 0.3 = fold-level (přísné)
                                # 0.4 = superfamily-level (doporučené)
                                # 0.5 = family-level
+    'cdhit_threads': 4,      # CD-HIT threads (zvyšte na ncpus z PBS)
+    'cdhit_memory': 4000,    # CD-HIT memory (MB)
 }
 
 

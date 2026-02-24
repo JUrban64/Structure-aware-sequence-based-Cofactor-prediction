@@ -45,7 +45,8 @@ class SequenceClusterer:
     """
     
     def __init__(self, identity_threshold=0.4, word_size=None, 
-                 cdhit_path='cd-hit', threads=4, memory=4000):
+                 cdhit_path='cd-hit', threads=4, memory=4000,
+                 timeout=None):
         """
         Args:
             identity_threshold: sekvenční identita pro clusterování (0.0-1.0)
@@ -60,11 +61,13 @@ class SequenceClusterer:
             cdhit_path: cesta k CD-HIT binárce
             threads: počet vláken
             memory: paměť v MB
+            timeout: max čas pro CD-HIT v sekundách (None = auto dle počtu sekvencí)
         """
         self.identity_threshold = identity_threshold
         self.cdhit_path = cdhit_path
         self.threads = threads
         self.memory = memory
+        self.timeout = timeout
         
         # Auto word size podle CD-HIT dokumentace
         if word_size is None:
@@ -99,12 +102,32 @@ class SequenceClusterer:
         if ids is None:
             ids = [f"seq_{i}" for i in range(len(sequences))]
         
-        # Zkontroluj dostupnost CD-HIT
         if not self._check_cdhit():
             print("  ⚠ CD-HIT není nainstalován, používám fallback MMseqs2/BLAST")
             return self._fallback_clustering(sequences)
         
-        # Zapiš FASTA do temp souboru
+        # ---- Auto timeout: škáluje s počtem sekvencí ----
+        if self.timeout is None:
+            timeout = max(600, min(14400, len(sequences) * 2))
+        else:
+            timeout = self.timeout
+        
+        # ---- Pro velké datasety: dvoustupňový clustering ----
+        # Nejprve cluster na 90% (rychlé), pak na cílový threshold
+        use_two_stage = (len(sequences) > 5000 
+                         and self.identity_threshold < 0.7)
+        
+        if use_two_stage:
+            print(f"  Dvoustupňový CD-HIT: "
+                  f"{len(sequences)} sekvencí → 0.9 → {self.identity_threshold}")
+            clusters = self._two_stage_cdhit(sequences, ids, timeout)
+        else:
+            clusters = self._single_stage_cdhit(sequences, ids, timeout)
+        
+        return clusters
+    
+    def _single_stage_cdhit(self, sequences, ids, timeout):
+        """Standardní jednofázový CD-HIT."""
         with tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', 
                                           delete=False) as fasta_file:
             for i, (seq_id, seq) in enumerate(zip(ids, sequences)):
@@ -114,7 +137,6 @@ class SequenceClusterer:
         output_path = fasta_path + '.cdhit'
         
         try:
-            # Spusť CD-HIT
             cmd = [
                 self.cdhit_path,
                 '-i', fasta_path,
@@ -123,40 +145,125 @@ class SequenceClusterer:
                 '-n', str(self.word_size),
                 '-M', str(self.memory),
                 '-T', str(self.threads),
-                '-d', '0',  # plné jméno sekvence v .clstr souboru
+                '-d', '0',
             ]
             
-            print(f"  Spouštím CD-HIT: identity={self.identity_threshold}, "
-                  f"word_size={self.word_size}")
-            
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=3600
+                cmd, capture_output=True, text=True, timeout=timeout
             )
             
             if result.returncode != 0:
-                raise RuntimeError(f"CD-HIT selhal:\n{result.stderr}")
+                print(f"  ⚠ CD-HIT chyba: {result.stderr[:200]}")
+                return self._fallback_clustering(sequences)
             
-            # Parsuj výstup (.clstr soubor)
             clusters = self._parse_cdhit_output(output_path + '.clstr')
-            
             print(f"  ✓ {len(sequences)} sekvencí → {len(clusters)} clusterů "
-                  f"(identity={self.identity_threshold})")
-            
-            # Statistiky
-            sizes = [len(v) for v in clusters.values()]
-            print(f"    Cluster sizes: min={min(sizes)}, max={max(sizes)}, "
-                  f"median={np.median(sizes):.0f}, mean={np.mean(sizes):.1f}")
-            print(f"    Singletons: {sum(1 for s in sizes if s == 1)} "
-                  f"({sum(1 for s in sizes if s == 1)/len(clusters)*100:.1f}%)")
-            
+                  f"(CD-HIT, identity={self.identity_threshold})")
             return clusters
-            
+        
+        except subprocess.TimeoutExpired:
+            print(f"  ⚠ CD-HIT timeout po {timeout}s, "
+                  f"přepínám na fallback clustering")
+            return self._fallback_clustering(sequences)
+        
         finally:
-            # Cleanup temp souborů
             for f in [fasta_path, output_path, output_path + '.clstr']:
                 if os.path.exists(f):
                     os.unlink(f)
     
+    def _two_stage_cdhit(self, sequences, ids, timeout):
+        """
+        Dvoustupňový clustering pro velké datasety:
+        1. CD-HIT na 90% identity (velmi rychlé) → redukuje počet sekvencí
+        2. CD-HIT na cílový threshold (pomalejší, ale méně sekvencí)
+        """
+        # Stage 1: 90% identity
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', 
+                                          delete=False) as f1:
+            for i, (seq_id, seq) in enumerate(zip(ids, sequences)):
+                f1.write(f">{seq_id}__idx__{i}\n{seq}\n")
+            path1 = f1.name
+        
+        out1 = path1 + '.stage1'
+        
+        try:
+            # Stage 1
+            cmd1 = [
+                self.cdhit_path,
+                '-i', path1, '-o', out1,
+                '-c', '0.9', '-n', '5',
+                '-M', str(self.memory),
+                '-T', str(self.threads),
+                '-d', '0',
+            ]
+            r1 = subprocess.run(cmd1, capture_output=True, text=True, 
+                               timeout=timeout // 2)
+            
+            if r1.returncode != 0:
+                print(f"  ⚠ Stage 1 chyba, fallback")
+                return self._fallback_clustering(sequences)
+            
+            n_stage1 = sum(1 for line in open(out1) if line.startswith('>'))
+            print(f"    Stage 1: {len(sequences)} → {n_stage1} (90% identity)")
+            
+            # Stage 2: target identity na reprezentanty
+            out2 = out1 + '.stage2'
+            cmd2 = [
+                self.cdhit_path,
+                '-i', out1, '-o', out2,
+                '-c', str(self.identity_threshold),
+                '-n', str(self.word_size),
+                '-M', str(self.memory),
+                '-T', str(self.threads),
+                '-d', '0',
+            ]
+            r2 = subprocess.run(cmd2, capture_output=True, text=True, 
+                               timeout=timeout)
+            
+            if r2.returncode != 0:
+                print(f"  ⚠ Stage 2 chyba, fallback")
+                return self._fallback_clustering(sequences)
+            
+            # Parsuj stage 2 clustery (mají reprezentantové indexy)
+            stage2_clusters = self._parse_cdhit_output(out2 + '.clstr')
+            # Parsuj stage 1 clustery
+            stage1_clusters = self._parse_cdhit_output(out1 + '.clstr')
+            
+            # Zkombinuj: stage2 cluster → stage1 clustery → original indexy
+            final_clusters = {}
+            # stage1: {cluster_id: [original_indices]}
+            # stage2: {cluster_id: [stage1_representative_indices]}
+            # stage1 representative = první člen (index 0 v stage1 clusteru)
+            
+            # Mapuj stage1 repr → original indices
+            stage1_repr_to_members = {}
+            for cid, members in stage1_clusters.items():
+                repr_idx = members[0]  # representant
+                stage1_repr_to_members[repr_idx] = members
+            
+            for cid2, stage2_members in stage2_clusters.items():
+                final_members = []
+                for s1_repr in stage2_members:
+                    if s1_repr in stage1_repr_to_members:
+                        final_members.extend(stage1_repr_to_members[s1_repr])
+                    else:
+                        final_members.append(s1_repr)
+                final_clusters[cid2] = final_members
+            
+            print(f"    Stage 2: {n_stage1} → {len(final_clusters)} clusterů "
+                  f"(identity={self.identity_threshold})")
+            return final_clusters
+        
+        except subprocess.TimeoutExpired:
+            print(f"  ⚠ Two-stage CD-HIT timeout, fallback")
+            return self._fallback_clustering(sequences)
+        
+        finally:
+            for f in [path1, out1, out1 + '.clstr',
+                      out1 + '.stage2', out1 + '.stage2.clstr']:
+                if os.path.exists(f):
+                    os.unlink(f)
+
     def _check_cdhit(self) -> bool:
         """Zkontroluje, zda je CD-HIT dostupný."""
         try:
