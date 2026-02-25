@@ -1,7 +1,41 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
 
-visualize_graph.py
+# Jupyter
+.ipynb_checkpoints/
+
+# Modely a checkpointy
+*.pth
+*.pt
+
+# Data (příliš velké pro Git)
+data/*/PDB/
+cache/
+*.npz
+
+# Obrázky
 *.png
+*.jpg
+*.svg
 
-*.sh
+# Visualize script (nechcete v repu)
+visualize_graph.py
+
+# Conda/venv
+.conda/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Scratch/temp
+*.log
+*.tmp

@@ -23,6 +23,10 @@ class SequenceDataset(Dataset):
     """
     Dataset pro sekvence bez PDB struktury.
     
+    Podporuje dva režimy:
+      1) Lazy-loading z disku (emb_dir) – doporučeno pro úsporu RAM
+      2) In-memory embeddingy (precomputed_embeddings / esm_extractor) – zpětná kompatibilita
+    
     Vstupní formát (CSV):
         uniprot_id,sequence,label,cofactor
         P12345,MVLSPADKTN...,1,NAD
@@ -32,7 +36,8 @@ class SequenceDataset(Dataset):
     """
     
     def __init__(self, sequences, labels, esm_extractor=None,
-                 precomputed_embeddings=None, max_length=1024):
+                 precomputed_embeddings=None, max_length=1024,
+                 emb_dir=None, seq_ids=None):
         """
         Args:
             sequences: list of AA sequences (strings)
@@ -40,6 +45,8 @@ class SequenceDataset(Dataset):
             esm_extractor: ESMFeatureExtractor instance (pro on-the-fly extraction)
             precomputed_embeddings: dict {seq_id: np.array [L, 1280]}
             max_length: maximální délka sekvence (delší se oříznou)
+            emb_dir: složka s .npy soubory (lazy-loading z disku)
+            seq_ids: list of identifikátorů sekvencí (pro pojmenování .npy souborů)
         """
         assert len(sequences) == len(labels)
         
@@ -48,14 +55,20 @@ class SequenceDataset(Dataset):
         self.max_length = max_length
         self.esm_extractor = esm_extractor
         self.precomputed = precomputed_embeddings or {}
+        self.emb_dir = emb_dir
+        self.seq_ids = seq_ids or list(range(len(sequences)))
         
-        # Pre-compute embeddings pokud máme extraktor a nejsou precomputed
-        if esm_extractor is not None and len(self.precomputed) == 0:
+        # Lazy-loading režim: embeddingy se čtou z disku v __getitem__
+        if self.emb_dir is not None:
+            print(f"  SequenceDataset: lazy-loading z {self.emb_dir} "
+                  f"({len(self.sequences)} sekvencí)")
+        elif esm_extractor is not None and len(self.precomputed) == 0:
+            # Zpětná kompatibilita: in-memory precompute
             print("Pre-computing ESM embeddings for sequence dataset...")
             self._precompute_embeddings()
     
     def _precompute_embeddings(self):
-        """Pre-compute a uložit ESM embeddings pro všechny sekvence."""
+        """Pre-compute a uložit ESM embeddings pro všechny sekvence (in-memory)."""
         for i, seq in enumerate(self.sequences):
             if i not in self.precomputed:
                 truncated = seq[:self.max_length]
@@ -82,7 +95,22 @@ class SequenceDataset(Dataset):
         seq = self.sequences[idx][:self.max_length]
         label = self.labels[idx]
         
-        if idx in self.precomputed:
+        # Režim 1: lazy-loading z disku
+        if self.emb_dir is not None:
+            sid = self.seq_ids[idx]
+            npy_path = os.path.join(self.emb_dir, f"{sid}.npy")
+            if os.path.exists(npy_path):
+                emb = np.load(npy_path)
+            elif self.esm_extractor is not None:
+                emb = self.esm_extractor.extract_embeddings(seq)
+                np.save(npy_path, emb)
+            else:
+                raise RuntimeError(
+                    f"Embedding soubor {npy_path} neexistuje a "
+                    f"ESM extractor není dostupný"
+                )
+        # Režim 2: in-memory
+        elif idx in self.precomputed:
             emb = self.precomputed[idx]
         elif self.esm_extractor is not None:
             emb = self.esm_extractor.extract_embeddings(seq)

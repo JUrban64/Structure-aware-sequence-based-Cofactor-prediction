@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -N TRAIN_SQ_test_13
-#PBS -l select=1:ncpus=4:ngpus=1:mem=160gb:scratch_ssd=70gb
+#PBS -l select=1:ncpus=4:ngpus=1:mem=48gb:scratch_ssd=100gb
 #PBS -l walltime=04:00:00
 
 

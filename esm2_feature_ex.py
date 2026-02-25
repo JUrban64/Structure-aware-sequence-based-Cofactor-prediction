@@ -1,5 +1,7 @@
 from transformers import AutoTokenizer, EsmModel
 import torch
+import numpy as np
+import os
 
 
 
@@ -124,6 +126,48 @@ class ESMFeatureExtractor:
                 all_embeddings.append(emb.cpu().numpy())
         
         return all_embeddings
+
+    def extract_and_save_to_disk(self, sequences, output_dir, 
+                                  max_length=1024, batch_size=1):
+        """
+        Extrahuje ESM embeddingy a ukládá je inkrementálně na disk
+        jako jednotlivé .npy soubory. Přeskakuje sekvence, pro které
+        soubor již existuje (resume-safe).
+        
+        Toto je hlavní mechanismus pro úsporu RAM – embeddingy se
+        nikdy nehromadí v paměti.
+        
+        Args:
+            sequences: list of (seq_id, sequence) tuples
+            output_dir: složka pro .npy soubory
+            max_length: maximální délka sekvence (ESM truncation)
+            batch_size: počet sekvencí najednou (1 = nejmenší RAM)
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        total = len(sequences)
+        skipped = 0
+        computed = 0
+        
+        for i, (seq_id, seq) in enumerate(sequences):
+            npy_path = os.path.join(output_dir, f"{seq_id}.npy")
+            
+            # Přeskoč pokud již existuje (resume-safe)
+            if os.path.exists(npy_path):
+                skipped += 1
+                continue
+            
+            truncated = seq[:max_length]
+            emb = self.extract_embeddings(truncated)  # [L, 1280] numpy
+            np.save(npy_path, emb)
+            computed += 1
+            
+            if (i + 1) % 100 == 0:
+                print(f"    [{i+1}/{total}] uloženo {computed}, "
+                      f"přeskočeno {skipped}")
+        
+        print(f"  ✓ Hotovo: {computed} nových, {skipped} přeskočeno "
+              f"z {total} celkem")
 
 
 # Použití

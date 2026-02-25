@@ -27,6 +27,7 @@ Kroky pipeline:
 
 import os
 import sys
+import gc
 import glob
 import pickle
 import argparse
@@ -35,6 +36,17 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 from sklearn.model_selection import train_test_split
+
+
+def log_memory(tag=""):
+    """Vypíše aktuální spotřebu RAM (RSS) procesu."""
+    try:
+        import psutil
+        proc = psutil.Process()
+        rss_gb = proc.memory_info().rss / 1024**3
+        print(f"  [MEM] {tag}: {rss_gb:.2f} GB RSS")
+    except ImportError:
+        pass  # psutil není dostupný – tiše přeskočíme
 
 # ============================================================
 # KONFIGURACE
@@ -256,6 +268,13 @@ def compute_esm_embeddings(binding_sites, esm_model_name, cache_dir):
     if skipped > 0:
         print(f"  ⚠ Přeskočeno {skipped} binding sites kvůli chybám")
     
+    # Uvolni ESM model z GPU i RAM
+    del esm
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    log_memory("po uvolnění ESM (binding sites)")
+    
     # Ulož cache
     with open(cache_file, 'wb') as f:
         pickle.dump(embeddings_cache, f)
@@ -366,7 +385,13 @@ def build_graph_dataset(binding_sites, include_ligand=True):
 # KROK 4: Sekvenční dataset
 # ============================================================
 def load_sequence_data(config):
-    """Načte a připraví sekvenční dataset z positive + negative CSV."""
+    """Načte a připraví sekvenční dataset z positive + negative CSV.
+    
+    Používá disk-based ESM embeddingy (lazy-loading) pro úsporu RAM:
+    1. Embeddingy se uloží jako jednotlivé .npy soubory na disk
+    2. SequenceDataset je čte on-demand v __getitem__
+    3. ESM model se uvolní z paměti po extrakci
+    """
     from sequence_dataset import (
         SequenceDataset, load_sequences_from_separate_csvs, 
         save_embeddings, load_embeddings
@@ -395,32 +420,51 @@ def load_sequence_data(config):
         print("  ⚠ Žádné sekvence nenačteny")
         return None
     
-    # Zkus načíst precomputed embeddingy
-    os.makedirs(cache_dir, exist_ok=True)
-    emb_cache = os.path.join(cache_dir, f'seq_embeddings_{ligand}.npz')
-    precomputed = None
-    if os.path.exists(emb_cache):
-        print("  Načítám seq embeddingy z cache...")
-        precomputed = load_embeddings(emb_cache)
+    log_memory("před ESM seq embeddingy")
     
-    if precomputed and len(precomputed) == len(sequences):
-        dataset = SequenceDataset(
-            sequences, labels,
-            precomputed_embeddings=precomputed,
-            max_length=512
-        )
-    else:
-        print(f"  Počítám ESM embeddingy pro {len(sequences)} sekvencí...")
+    # Složka pro per-sequence .npy embeddingy (disk-based cache)
+    emb_dir = os.path.join(cache_dir, f'seq_emb_{ligand}')
+    os.makedirs(emb_dir, exist_ok=True)
+    
+    # Generuj stabilní seq_ids (hash sekvence → deterministické jméno)
+    import hashlib
+    seq_ids = [hashlib.md5(seq.encode()).hexdigest()[:12] for seq in sequences]
+    
+    # Zkontroluj kolik embeddingů už existuje na disku
+    existing = sum(1 for sid in seq_ids 
+                   if os.path.exists(os.path.join(emb_dir, f"{sid}.npy")))
+    
+    if existing < len(sequences):
+        missing = len(sequences) - existing
+        print(f"  {existing}/{len(sequences)} embeddingů na disku, "
+              f"chybí {missing} → spouštím ESM extrakci")
+        
         esm = ESMFeatureExtractor(model_name=esm_model_name)
-        dataset = SequenceDataset(
-            sequences, labels,
-            esm_extractor=esm,
+        esm.extract_and_save_to_disk(
+            list(zip(seq_ids, sequences)),
+            output_dir=emb_dir,
             max_length=512
         )
-        # Ulož cache
-        save_embeddings(dataset.precomputed, emb_cache)
+        
+        # Uvolni ESM model z GPU i RAM
+        del esm
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        log_memory("po uvolnění ESM (sekvence)")
+    else:
+        print(f"  ✓ Všech {existing} embeddingů nalezeno na disku")
     
-    print(f"  ✓ {len(dataset)} sekvencí připraveno")
+    # Vytvoř dataset s lazy-loading z disku
+    dataset = SequenceDataset(
+        sequences, labels,
+        emb_dir=emb_dir,
+        seq_ids=seq_ids,
+        max_length=512
+    )
+    
+    log_memory("po vytvoření SequenceDataset (lazy)")
+    print(f"  ✓ {len(dataset)} sekvencí připraveno (lazy-loading z disku)")
     return dataset
 
 
@@ -529,21 +573,25 @@ def _build_seq_subsets_from_loaded(loaded_splits, esm_extractor=None,
     
     Každý split je dict s 'sequences' a 'labels' → vytvoří se
     samostatný SequenceDataset pro train/val/test.
+    Používá disk-based lazy-loading pro úsporu RAM.
     
     Returns:
         (train_dataset, val_dataset, test_dataset)
     """
-    from sequence_dataset import SequenceDataset, save_embeddings, load_embeddings
+    import hashlib
+    from sequence_dataset import SequenceDataset
+    from esm2_feature_ex import ESMFeatureExtractor
     
     train_data, val_data, test_data = loaded_splits[:3]
     datasets = []
+    
+    esm_loaded = False  # ESM se načte maximálně jednou
     
     for name, data in [('train', train_data), ('val', val_data), ('test', test_data)]:
         if isinstance(data, dict) and 'sequences' in data:
             seqs = data['sequences']
             labs = data['labels']
         elif isinstance(data, list) and len(data) > 0:
-            # Fallback: pokud data jsou list
             seqs = [d.get('sequence', '') if isinstance(d, dict) else '' for d in data]
             labs = [d.get('label', 0) if isinstance(d, dict) else 0 for d in data]
         else:
@@ -554,30 +602,46 @@ def _build_seq_subsets_from_loaded(loaded_splits, esm_extractor=None,
             datasets.append(None)
             continue
         
-        # Zkus cache pro embeddingy
-        precomputed = None
+        # Disk-based lazy-loading
         if cache_dir:
-            emb_cache = os.path.join(cache_dir, f'seq_embeddings_{name}_split.npz')
-            if os.path.exists(emb_cache):
-                precomputed = load_embeddings(emb_cache)
-                if len(precomputed) != len(seqs):
-                    precomputed = None
-        
-        if precomputed and len(precomputed) == len(seqs):
-            ds = SequenceDataset(seqs, labs, precomputed_embeddings=precomputed,
-                               max_length=max_length)
+            emb_dir = os.path.join(cache_dir, f'seq_emb_{name}_split')
+            os.makedirs(emb_dir, exist_ok=True)
+            
+            seq_ids = [hashlib.md5(s.encode()).hexdigest()[:12] for s in seqs]
+            
+            existing = sum(1 for sid in seq_ids 
+                           if os.path.exists(os.path.join(emb_dir, f"{sid}.npy")))
+            
+            if existing < len(seqs):
+                if esm_extractor is None and esm_model_name:
+                    esm_extractor = ESMFeatureExtractor(model_name=esm_model_name)
+                    esm_loaded = True
+                if esm_extractor is not None:
+                    esm_extractor.extract_and_save_to_disk(
+                        list(zip(seq_ids, seqs)),
+                        output_dir=emb_dir,
+                        max_length=max_length
+                    )
+            
+            ds = SequenceDataset(seqs, labs, emb_dir=emb_dir,
+                               seq_ids=seq_ids, max_length=max_length)
         else:
+            # Fallback bez cache_dir (in-memory)
             if esm_extractor is None and esm_model_name:
-                from esm2_feature_ex import ESMFeatureExtractor
                 esm_extractor = ESMFeatureExtractor(model_name=esm_model_name)
+                esm_loaded = True
             ds = SequenceDataset(seqs, labs, esm_extractor=esm_extractor,
                                max_length=max_length)
-            if cache_dir:
-                os.makedirs(cache_dir, exist_ok=True)
-                emb_cache = os.path.join(cache_dir, f'seq_embeddings_{name}_split.npz')
-                save_embeddings(ds.precomputed, emb_cache)
         
         datasets.append(ds)
+    
+    # Uvolni ESM pokud byl načten
+    if esm_loaded and esm_extractor is not None:
+        del esm_extractor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        log_memory("po uvolnění ESM (loaded splits)")
     
     return tuple(datasets)
 
@@ -1149,6 +1213,7 @@ def main():
     n_neg = sum(1 for bs in binding_sites if bs['label'] == 0)
     print(f"\nCelkem: {len(binding_sites)} binding sites "
           f"(pozitivní: {n_pos}, negativní: {n_neg})")
+    log_memory("po extrakci binding sites")
     
     # ---- KROK 2: ESM embeddingy ----
     print(f"\n{'='*60}")
@@ -1159,6 +1224,15 @@ def main():
         binding_sites, config['esm_model'], config['cache_dir']
     )
     
+    # Uvolni BioPython Residue/Structure objekty – po ESM extrakci
+    # a _update_bs_for_valid_indices už nejsou potřeba.
+    # binding_site_graph.py používá jen contact_map, ligand_atoms, 
+    # protein_ligand_contacts (numpy/dict), ne BioPython objekty.
+    for bs in binding_sites:
+        bs.pop('binding_site_residues', None)
+    gc.collect()
+    log_memory("po ESM embeddingách + cleanup residues")
+    
     # ---- KROK 3: Grafový dataset ----
     print(f"\n{'='*60}")
     print("[KROK 3/5] Stavba grafového datasetu")
@@ -1168,6 +1242,11 @@ def main():
         binding_sites, include_ligand=config.get('include_ligand', True)
     )
     
+    # Uvolni binding_sites – data jsou nyní v graph_dataset.graphs
+    del binding_sites
+    gc.collect()
+    log_memory("po uvolnění binding_sites")
+    
     # ---- KROK 4: Sekvenční dataset (volitelné) ----
     seq_dataset = None
     if not args.no_seq:
@@ -1176,6 +1255,7 @@ def main():
         print(f"{'='*60}")
         
         seq_dataset = load_sequence_data(config)
+        log_memory("po načtení sekvenčního datasetu")
     
     # ---- KROK 5: Trénink ----
     print(f"\n{'='*60}")
