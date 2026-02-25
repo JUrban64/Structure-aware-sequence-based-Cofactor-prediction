@@ -88,6 +88,8 @@ DEFAULT_CONFIG = {
     'struct_weight': 5.0,       # zvýšená váha GNN loss (kompenzuje malý dataset)
     'seq_weight': 1.0,          # váha sequence loss
     'early_stopping_patience': 10,  # zastaví trénink po 10 epochách bez zlepšení
+    'batch_size_graph': 32,     # batch size pro grafový loader
+    'batch_size_seq': 32,       # batch size pro sekvenční loader
     
     # Cluster-based split (ochrana proti data leakage)
     'cluster_identity': 0.4,  # MMseqs2 identity threshold
@@ -95,6 +97,8 @@ DEFAULT_CONFIG = {
                                # 0.4 = superfamily-level (doporučené)
                                # 0.5 = family-level
     'mmseqs_threads': 4,       # MMseqs2 threads (zvyšte na ncpus z PBS)
+
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
 }
 
 
@@ -460,8 +464,7 @@ def load_sequence_data(config, esm_extractor=None):
         print(f"  {existing}/{len(sequences)} embeddingů na disku, "
               f"chybí {missing} → spouštím ESM extrakci")
         
-        if esm_extractor is None:
-            print(f"  Načítám ESM-2 model: {esm_model_name}")
+        if esm_extractor is None and esm_model_name:
             esm_extractor = ESMFeatureExtractor(model_name=esm_model_name)
             esm_created_here = True
         else:
@@ -1132,6 +1135,7 @@ def main():
         config['pdb_negative_dir'] = args.pdb_neg_dir
     config['num_epochs'] = args.epochs
     config['batch_size_graph'] = args.batch_size
+    config['batch_size_seq'] = args.batch_size
     config['lr'] = args.lr
     config['ligand_name'] = args.ligand
     config['esm_model'] = args.esm_model
