@@ -35,7 +35,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from pathlib import Path
-from sklearn.model_selection import train_test_split
 
 
 def log_memory(tag=""):
@@ -77,17 +76,18 @@ DEFAULT_CONFIG = {
     'hidden_dim': 256,
     'num_gnn_layers': 3,
     'num_attention_heads': 4,
-    'dropout': 0.5,
+    'dropout': 0.6,
     'use_gat': True,
     'include_ligand': True,  # Přidat ligandové uzly a P-L hrany do grafu
     
     # Trénink
-    'batch_size_graph': 32,
-    'batch_size_seq': 16,
-    'num_epochs': 100,
-    'lr': 0.001,
-    'consistency_weight': 0.3,
-    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'num_epochs': 30,           # best AUC typicky kolem epochy 11
+    'lr': 0.0005,               # snížený LR pro stabilitu
+    'dropout': 0.6,             # regularizace
+    'consistency_weight': 0.5,  # alignment GNN ↔ Seq embeddingů
+    'struct_weight': 5.0,       # zvýšená váha GNN loss (kompenzuje malý dataset)
+    'seq_weight': 1.0,          # váha sequence loss
+    'early_stopping_patience': 10,  # zastaví trénink po 10 epochách bez zlepšení
     
     # Cluster-based split (ochrana proti data leakage)
     'cluster_identity': 0.4,  # MMseqs2 identity threshold
@@ -121,6 +121,11 @@ def parse_args():
     parser.add_argument('--cluster-identity', type=float, default=0.4,
                         help='MMseqs2 sequence identity threshold for '
                              'cluster-based split (default: 0.4 = superfamily)')
+    parser.add_argument('--struct-weight', type=float, default=5.0,
+                        help='Váha GNN struct loss (default: 5.0, kompenzuje '
+                             'malý PDB dataset oproti sekvencím)')
+    parser.add_argument('--patience', type=int, default=10,
+                        help='Early stopping patience (default: 10 epoch)')
     parser.add_argument('--save-splits', type=str, default=None,
                         help='Cesta ke složce, kam se uloží rozdělené datasety '
                              '(train/val/test). Pokud není zadáno, splity se '
@@ -192,8 +197,16 @@ def extract_binding_sites(pdb_dir, ligand_name, distance_threshold,
 # ============================================================
 # KROK 2: ESM-2 embeddingy
 # ============================================================
-def compute_esm_embeddings(binding_sites, esm_model_name, cache_dir):
-    """Extrahuje ESM embeddingy pro binding sites (s cachováním)."""
+def compute_esm_embeddings(binding_sites, esm_model_name, cache_dir,
+                           esm_extractor=None):
+    """Extrahuje ESM embeddingy pro binding sites (s cachováním).
+    
+    Args:
+        esm_extractor: volitelná existující ESM instance (pro sdílení mezi kroky)
+    
+    Returns:
+        esm_extractor: ESM instance (pro znovupoužití v dalších krocích)
+    """
     from esm2_feature_ex import ESMFeatureExtractor
     
     cache_file = os.path.join(cache_dir, 'esm_embeddings.pkl')
@@ -224,13 +237,17 @@ def compute_esm_embeddings(binding_sites, esm_model_name, cache_dir):
                 if 'valid_indices' in cached[i]:
                     _update_bs_for_valid_indices(bs, cached[i]['valid_indices'])
             print(f"  ✓ {len(cached)} embeddingů načteno z cache")
-            return
+            return esm_extractor  # vrátí None nebo existující instanci
         else:
             print(f"  Cache neodpovídá ({len(cached)} vs {len(binding_sites)}), "
                   "přepočítávám...")
     
-    print(f"  Načítám ESM-2 model: {esm_model_name}")
-    esm = ESMFeatureExtractor(model_name=esm_model_name)
+    if esm_extractor is None:
+        print(f"  Načítám ESM-2 model: {esm_model_name}")
+        esm = ESMFeatureExtractor(model_name=esm_model_name)
+    else:
+        print(f"  Používám sdílenou ESM instanci (bez opakovaného načítání)")
+        esm = esm_extractor
     
     embeddings_cache = []
     skipped = 0
@@ -268,17 +285,13 @@ def compute_esm_embeddings(binding_sites, esm_model_name, cache_dir):
     if skipped > 0:
         print(f"  ⚠ Přeskočeno {skipped} binding sites kvůli chybám")
     
-    # Uvolni ESM model z GPU i RAM
-    del esm
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    gc.collect()
-    log_memory("po uvolnění ESM (binding sites)")
-    
     # Ulož cache
     with open(cache_file, 'wb') as f:
         pickle.dump(embeddings_cache, f)
     print(f"  ✓ {len(embeddings_cache)} embeddingů uloženo do cache")
+    
+    # Vrať ESM instanci pro znovupoužití (neuvolněno!)
+    return esm
 
 
 def _update_bs_for_valid_indices(bs, valid_indices):
@@ -384,13 +397,20 @@ def build_graph_dataset(binding_sites, include_ligand=True):
 # ============================================================
 # KROK 4: Sekvenční dataset
 # ============================================================
-def load_sequence_data(config):
+def load_sequence_data(config, esm_extractor=None):
     """Načte a připraví sekvenční dataset z positive + negative CSV.
     
     Používá disk-based ESM embeddingy (lazy-loading) pro úsporu RAM:
     1. Embeddingy se uloží jako jednotlivé .npy soubory na disk
     2. SequenceDataset je čte on-demand v __getitem__
-    3. ESM model se uvolní z paměti po extrakci
+    3. ESM model se uvolní z paměti po extrakci (pokud nebyl předán zvenčí)
+    
+    Args:
+        config: konfigurace pipeline
+        esm_extractor: volitelná sdílená ESM instance (pro úsporu paměti)
+    
+    Returns:
+        (dataset, esm_extractor) - dataset a ESM instance (pro další použití)
     """
     from sequence_dataset import (
         SequenceDataset, load_sequences_from_separate_csvs, 
@@ -434,24 +454,24 @@ def load_sequence_data(config):
     existing = sum(1 for sid in seq_ids 
                    if os.path.exists(os.path.join(emb_dir, f"{sid}.npy")))
     
+    esm_created_here = False
     if existing < len(sequences):
         missing = len(sequences) - existing
         print(f"  {existing}/{len(sequences)} embeddingů na disku, "
               f"chybí {missing} → spouštím ESM extrakci")
         
-        esm = ESMFeatureExtractor(model_name=esm_model_name)
-        esm.extract_and_save_to_disk(
+        if esm_extractor is None:
+            print(f"  Načítám ESM-2 model: {esm_model_name}")
+            esm_extractor = ESMFeatureExtractor(model_name=esm_model_name)
+            esm_created_here = True
+        else:
+            print(f"  Používám sdílenou ESM instanci")
+        
+        esm_extractor.extract_and_save_to_disk(
             list(zip(seq_ids, sequences)),
             output_dir=emb_dir,
             max_length=512
         )
-        
-        # Uvolni ESM model z GPU i RAM
-        del esm
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-        log_memory("po uvolnění ESM (sekvence)")
     else:
         print(f"  ✓ Všech {existing} embeddingů nalezeno na disku")
     
@@ -465,7 +485,7 @@ def load_sequence_data(config):
     
     log_memory("po vytvoření SequenceDataset (lazy)")
     print(f"  ✓ {len(dataset)} sekvencí připraveno (lazy-loading z disku)")
-    return dataset
+    return dataset, esm_extractor
 
 
 # ============================================================
@@ -831,12 +851,17 @@ def train_dual(config, graph_dataset, seq_dataset=None):
         seq_val_loader=seq_val_loader,
         device=device,
         lr=config['lr'],
-        consistency_weight=config['consistency_weight']
+        consistency_weight=config['consistency_weight'],
+        struct_weight=config.get('struct_weight', 5.0),
+        seq_weight=config.get('seq_weight', 1.0)
     )
     
-    # ---- Trénink ----
-    trainer.train(num_epochs=config['num_epochs'])
-    
+    # ---- Trénink s early stopping ----
+    trainer.train(
+        num_epochs=config['num_epochs'],
+        patience=config.get('early_stopping_patience', 10)
+    )
+
     return model
 
 
@@ -1111,6 +1136,8 @@ def main():
     config['ligand_name'] = args.ligand
     config['esm_model'] = args.esm_model
     config['cluster_identity'] = args.cluster_identity
+    config['struct_weight'] = args.struct_weight
+    config['early_stopping_patience'] = args.patience
     
     # Save splits / prepare-only
     if args.save_splits:
@@ -1220,7 +1247,7 @@ def main():
     print("[KROK 2/5] ESM-2 embeddingy")
     print(f"{'='*60}")
     
-    compute_esm_embeddings(
+    esm_extractor = compute_esm_embeddings(
         binding_sites, config['esm_model'], config['cache_dir']
     )
     
@@ -1254,8 +1281,19 @@ def main():
         print("[KROK 4/5] Sekvenční dataset")
         print(f"{'='*60}")
         
-        seq_dataset = load_sequence_data(config)
+        # Sdílíme ESM instanci z kroku 2 (pokud existuje) → bez opakovaného načítání
+        seq_dataset, esm_extractor = load_sequence_data(config, esm_extractor)
         log_memory("po načtení sekvenčního datasetu")
+    
+    # Uvolni ESM model – už není potřeba (oba kroky dokončeny)
+    if esm_extractor is not None:
+        print("  Uvolnění sdílené ESM instance z paměti...")
+        del esm_extractor
+        esm_extractor = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        log_memory("po uvolnění sdílené ESM instance")
     
     # ---- KROK 5: Trénink ----
     print(f"\n{'='*60}")

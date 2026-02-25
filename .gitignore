@@ -39,3 +39,6 @@ Thumbs.db
 # Scratch/temp
 *.log
 *.tmp
+
+
+TRAIN_*

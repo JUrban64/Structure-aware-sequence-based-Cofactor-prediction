@@ -1,11 +1,17 @@
 #!/bin/bash
-#PBS -N TRAIN_SQ_test_13
-#PBS -l select=1:ncpus=4:ngpus=1:mem=48gb:scratch_ssd=100gb
-#PBS -l walltime=04:00:00
+#PBS -N TRAIN_SQ_test_18
+#PBS -l select=1:ncpus=4:ngpus=1:mem=100gb:scratch_ssd=100gb
+#PBS -l walltime=05:00:00
 
 
 
 DATADIR=/auto/brno2/home/urbany/SeQbCoP/Structure-aware-sequence-based-Cofactor-prediction
+
+
+
+
+
+
 
 module add mambaforge
 mamba activate sqbcp_gpu
@@ -26,7 +32,7 @@ cp -r $DATADIR/data $SCRATCHDIR
 cp -r $DATADIR/cache $SCRATCHDIR 2>/dev/null || true
 
 
-python3 run_pipeline.py --batch-size 16 --epochs 50 --save-splits splits/ --load-splits splits/ 
+python3 run_pipeline.py --batch-size 16 --epochs 30 --struct-weight 5.0 --patience 10 --save-splits splits/
 
 
 

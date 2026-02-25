@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch_geometric.loader import DataLoader as PyGDataLoader
 import numpy as np
@@ -74,14 +74,10 @@ class DualTrainer:
             weight_decay=weight_decay
         )
         
-        # Scheduler
-        self.scheduler = ReduceLROnPlateau(
-            self.optimizer,
-            mode='max',
-            factor=0.5,
-            patience=10,
-            verbose=True
-        )
+        # Scheduler – bude inicializován v train() metodě
+        # (potřebujeme znát num_epochs pro CosineAnnealingLR)
+        self.scheduler = None
+        self.lr = lr
         
         # Loss
         self.criterion = nn.CrossEntropyLoss()
@@ -378,17 +374,32 @@ class DualTrainer:
         
         return results
     
-    def train(self, num_epochs=100, both_loader=None):
+    def train(self, num_epochs=100, both_loader=None, patience=10):
         """
-        Hlavní trénovací smyčka.
+        Hlavní trénovací smyčka s early stopping a cosine annealing LR.
         
         Args:
-            num_epochs: počet epoch
+            num_epochs: maximální počet epoch
             both_loader: volitelný loader pro consistency training
+            patience: počet epoch bez zlepšení AUC pro early stopping
         """
         best_auc = 0
+        best_val_loss = float('inf')
+        no_improve = 0
+        
+        # Inicializace CosineAnnealingLR scheduleru
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer, T_max=num_epochs, eta_min=1e-6
+        )
+        
+        print(f"  Trénink: {num_epochs} epoch, early stopping patience={patience}")
+        print(f"  Struct weight: {self.struct_weight}, Seq weight: {self.seq_weight}, "
+              f"Consistency weight: {self.consistency_weight}")
+        print(f"  LR scheduler: CosineAnnealingLR (eta_min=1e-6)")
         
         for epoch in range(num_epochs):
+            current_lr = self.optimizer.param_groups[0]['lr']
+            
             # ---- Train ----
             train_loss, train_acc, train_metrics = self.train_epoch()
             
@@ -403,11 +414,11 @@ class DualTrainer:
             # Per-branch metrics
             branch_metrics = self.validate_per_branch()
             
-            # LR scheduling
-            self.scheduler.step(val_auc)
+            # LR scheduling (cosine annealing – krok každou epochu)
+            self.scheduler.step()
             
             # Logging
-            print(f"Epoch {epoch+1}/{num_epochs}")
+            print(f"Epoch {epoch+1}/{num_epochs} (lr={current_lr:.6f})")
             print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
             print(f"    Struct loss: {train_metrics.get('struct_loss', 0):.4f}, "
                   f"Seq loss: {train_metrics.get('seq_loss', 0):.4f}")
@@ -426,13 +437,29 @@ class DualTrainer:
                       f"AP: {branch_metrics['seq_ap']:.4f} "
                       f"(n={branch_metrics['seq_n']})")
             
-            # Save best model
+            # Save best model + early stopping
             if val_auc > best_auc:
                 best_auc = val_auc
+                no_improve = 0
                 torch.save(self.model.state_dict(), 'best_dual_model.pth')
-                print(f"  → New best AUC: {best_auc:.4f}")
+                print(f"  → New best AUC: {best_auc:.4f} (model uložen)")
+            else:
+                no_improve += 1
+                print(f"  (no improvement {no_improve}/{patience})")
+                if no_improve >= patience:
+                    print(f"\n  ⚠ Early stopping at epoch {epoch+1} "
+                          f"(no AUC improvement for {patience} epochs)")
+                    break
         
         print(f"\nTraining complete. Best AUC: {best_auc:.4f}")
+        
+        # Načti nejlepší model zpět
+        try:
+            self.model.load_state_dict(torch.load('best_dual_model.pth',
+                                                   map_location=self.device))
+            print("  Best model loaded back.")
+        except FileNotFoundError:
+            pass
 
 
 # ============================================================
