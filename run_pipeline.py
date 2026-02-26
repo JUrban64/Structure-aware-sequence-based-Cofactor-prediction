@@ -684,10 +684,81 @@ def _build_seq_subsets_from_loaded(loaded_splits, esm_extractor=None,
     return tuple(datasets)
 
 
+# ============================================================
+# BOTH LOADER – pro consistency loss (graf + full-seq ESM)
+# ============================================================
+def _build_both_loader(train_graphs, config, device):
+    """
+    Vytvoří DataLoader pro consistency training:
+    každý batch obsahuje PyG graf + full-sequence ESM embeddingy.
+    
+    1. Extrahuje full_sequence z grafů
+    2. Precompute full-seq ESM embeddingy na disk (pokud chybí)
+    3. Vytvoří BothDataset + DataLoader
+    """
+    from dual_train import BothDataset, collate_both
+    from torch.utils.data import DataLoader
+    import hashlib
+    
+    cache_dir = config.get('cache_dir', 'cache')
+    both_emb_dir = os.path.join(cache_dir, 'both_full_seq_emb')
+    os.makedirs(both_emb_dir, exist_ok=True)
+    
+    # Sesbírej unikátní full sekvence z trénovacích grafů
+    seq_id_map = {}  # seq_id → full_sequence
+    for g in train_graphs:
+        full_seq = g.full_sequence if hasattr(g, 'full_sequence') else g.sequence
+        sid = hashlib.md5(full_seq.encode()).hexdigest()[:12]
+        seq_id_map[sid] = full_seq
+    
+    # Zkontroluj, kolik embeddings chybí
+    missing = []
+    for sid, seq in seq_id_map.items():
+        npy_path = os.path.join(both_emb_dir, f"{sid}.npy")
+        if not os.path.exists(npy_path):
+            missing.append((sid, seq))
+    
+    if missing:
+        print(f"\n  Consistency loader: {len(missing)}/{len(seq_id_map)} "
+              f"full-seq embeddings chybí, spouštím ESM extrakci...")
+        from esm2_feature_ex import ESMFeatureExtractor
+        esm = ESMFeatureExtractor(model_name=config['esm_model'])
+        esm.extract_and_save_to_disk(
+            missing, output_dir=both_emb_dir, max_length=1024
+        )
+        # Uvolni ESM z paměti
+        del esm
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        log_memory("po uvolnění ESM (both_loader)")
+    else:
+        print(f"\n  Consistency loader: všech {len(seq_id_map)} "
+              f"full-seq embeddings nalezeno v cache")
+    
+    both_dataset = BothDataset(
+        graphs=train_graphs,
+        emb_dir=both_emb_dir,
+        max_length=1024
+    )
+    
+    both_loader = DataLoader(
+        both_dataset,
+        batch_size=config.get('batch_size_graph', 32),
+        shuffle=True,
+        collate_fn=collate_both
+    )
+    
+    print(f"  ✓ Both loader: {len(both_dataset)} vzorků "
+          f"(consistency weight: {config.get('consistency_weight', 0.5)})")
+    
+    return both_loader
+
+
 def train_dual(config, graph_dataset, seq_dataset=None):
     """Spustí dual-branch trénink."""
     from dual_predictor import DualBranchPredictor
-    from dual_train import DualTrainer
+    from dual_train import DualTrainer, BothDataset, collate_both
     from sequence_dataset import collate_sequences
     from torch.utils.data import DataLoader, Subset
     from torch_geometric.loader import DataLoader as PyGDataLoader
@@ -857,6 +928,13 @@ def train_dual(config, graph_dataset, seq_dataset=None):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Model: {total_params:,} parametrů")
     
+    # ---- Both loader (consistency loss: graf + full-seq ESM) ----
+    both_loader = None
+    if config.get('consistency_weight', 0) > 0 and len(train_graphs) > 0:
+        both_loader = _build_both_loader(
+            train_graphs, config, device
+        )
+    
     # ---- Trainer ----
     trainer = DualTrainer(
         model=model,
@@ -874,6 +952,7 @@ def train_dual(config, graph_dataset, seq_dataset=None):
     # ---- Trénink s early stopping ----
     trainer.train(
         num_epochs=config['num_epochs'],
+        both_loader=both_loader,
         patience=config.get('early_stopping_patience', 10)
     )
 

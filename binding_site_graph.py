@@ -220,6 +220,7 @@ class BindingSiteGraphDataset:
             y=y,
             # Metadata
             sequence=bs_info['binding_site_sequence'],
+            full_sequence=bs_info.get('full_sequence', bs_info['binding_site_sequence']),
             pdb_id=bs_info['pdb_file'],
             n_residues=bs_info['n_binding_site'],
             n_protein_nodes=n_prot,

@@ -12,17 +12,124 @@ Typický scénář:
   → Model se učí na obou, sdílený classifier se učí z mnohem více dat
 """
 
+import os
+import hashlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
+from torch_geometric.data import Batch as PyGBatch
 from torch_geometric.loader import DataLoader as PyGDataLoader
 import numpy as np
 from sklearn.metrics import roc_auc_score, f1_score, average_precision_score
 
 from sequence_dataset import collate_sequences
+
+
+# ============================================================
+# BOTH DATASET – pro consistency loss (graf + full-seq ESM)
+# ============================================================
+class BothDataset(Dataset):
+    """
+    Dataset, který pro PDB proteiny poskytuje ZÁROVEŇ:
+      - PyG graf (pro GNN branch)
+      - Full-sequence ESM embeddings (pro Sequence branch)
+    
+    Toto umožňuje consistency loss: obě větve vidí STEJNÝ protein,
+    a model penalizuje rozdíl jejich embeddingů.
+    
+    ESM embeddingy se čtou z disku (lazy-loading) nebo generují on-the-fly.
+    """
+    
+    def __init__(self, graphs, emb_dir, max_length=1024):
+        """
+        Args:
+            graphs: list of PyG Data (trénovací grafy)
+            emb_dir: složka s full-sequence ESM embeddingy (.npy soubory)
+            max_length: maximální délka sekvence
+        """
+        self.graphs = graphs
+        self.emb_dir = emb_dir
+        self.max_length = max_length
+        
+        # Vytvoř ID pro každý graf z full_sequence
+        self.seq_ids = []
+        for g in graphs:
+            full_seq = g.full_sequence if hasattr(g, 'full_sequence') else g.sequence
+            sid = hashlib.md5(full_seq.encode()).hexdigest()[:12]
+            self.seq_ids.append(sid)
+    
+    def __len__(self):
+        return len(self.graphs)
+    
+    def __getitem__(self, idx):
+        graph = self.graphs[idx]
+        sid = self.seq_ids[idx]
+        
+        # Načti full-sequence ESM embedding z disku
+        npy_path = os.path.join(self.emb_dir, f"{sid}.npy")
+        if os.path.exists(npy_path):
+            emb = np.load(npy_path)
+        else:
+            raise FileNotFoundError(
+                f"Full-seq ESM embedding nenalezen: {npy_path}. "
+                f"Spusťte precompute_both_embeddings() nejdříve."
+            )
+        
+        # Ořízni na max_length
+        if emb.shape[0] > self.max_length:
+            emb = emb[:self.max_length]
+        
+        emb_tensor = torch.FloatTensor(emb)
+        
+        return {
+            'graph': graph,
+            'embeddings': emb_tensor,        # [L, 1280]
+            'label': graph.y.squeeze(),       # scalar
+            'length': emb_tensor.shape[0],
+        }
+
+
+def collate_both(batch):
+    """
+    Custom collate pro BothDataset.
+    Kombinuje PyG batching (grafy) s paddingem (ESM embeddingy).
+    
+    Returns:
+        dict:
+            'graph': PyG Batch
+            'esm_embeddings': [B, max_L, 1280] padded tensor
+            'mask': [B, max_L] bool mask (True = padding)
+            'labels': [B] tensor
+    """
+    graphs = [item['graph'] for item in batch]
+    embeddings = [item['embeddings'] for item in batch]
+    labels = torch.stack([item['label'] for item in batch])
+    lengths = [item['length'] for item in batch]
+    
+    # PyG batching
+    graph_batch = PyGBatch.from_data_list(graphs)
+    
+    # Padding ESM embeddings
+    max_len = max(lengths)
+    emb_dim = embeddings[0].shape[1]
+    
+    padded = torch.zeros(len(batch), max_len, emb_dim)
+    mask = torch.ones(len(batch), max_len, dtype=torch.bool)  # True = padding
+    
+    for i, (emb, length) in enumerate(zip(embeddings, lengths)):
+        padded[i, :length] = emb
+        mask[i, :length] = False
+    
+    return {
+        'graph': graph_batch,
+        'esm_embeddings': padded,
+        'mask': mask,
+        'labels': labels,
+    }
 
 
 class DualTrainer:
