@@ -144,7 +144,7 @@ if __name__ == '__main__':
 
     # Split dataset
     train_graphs, val_graphs = train_test_split(
-        dataset.graphs, 
+        list(dataset), 
         test_size=0.2, 
         random_state=42
     )

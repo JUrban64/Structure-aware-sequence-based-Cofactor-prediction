@@ -591,11 +591,10 @@ def cluster_and_split_graphs(graph_dataset, sequences, labels,
     
     train_idx, val_idx, test_idx = splitter.split(sequences, labels)
     
-    graphs = graph_dataset.graphs if hasattr(graph_dataset, 'graphs') else graph_dataset
-    
-    train_graphs = [graphs[i] for i in train_idx]
-    val_graphs = [graphs[i] for i in val_idx]
-    test_graphs = [graphs[i] for i in test_idx]
+    # Lazy dataset: grafy se staví on-demand přes __getitem__
+    train_graphs = [graph_dataset[i] for i in train_idx]
+    val_graphs = [graph_dataset[i] for i in val_idx]
+    test_graphs = [graph_dataset[i] for i in test_idx]
     
     return train_graphs, val_graphs, test_graphs
 

@@ -159,7 +159,7 @@ class ESMFeatureExtractor:
             
             truncated = seq[:max_length]
             emb = self.extract_embeddings(truncated)  # [L, 1280] numpy
-            np.save(npy_path, emb)
+            np.save(npy_path, emb.astype(np.float16))
             computed += 1
             
             if (i + 1) % 100 == 0:

@@ -59,17 +59,10 @@ class BindingSiteGraphDataset:
             }
         
         self.feature_config = feature_config
-        self.graphs = self._build_graphs()
-    
-    def _build_graphs(self):
-        """Convert all binding sites to PyG graphs"""
-        graphs = []
-        
-        for bs_info in self.data:
-            graph = self._build_single_graph(bs_info)
-            graphs.append(graph)
-        
-        return graphs
+        # Labely a sekvence se drží zvlášť pro split bez stavby grafů
+        self.labels = [bs.get('label', 1) for bs in self.data]
+        self.sequences = [bs.get('binding_site_sequence', '') for bs in self.data]
+        self.pdb_ids = [bs.get('pdb_file', '') for bs in self.data]
     
     def _build_single_graph(self, bs_info):
         """
@@ -144,17 +137,17 @@ class BindingSiteGraphDataset:
         all_edge_types = [] # list of int
         all_edge_attr = []  # list of [EDGE_ATTR_DIM] float vectors
         
-        # 1) P-P edges: z kontaktní mapy
+        # 1) P-P edges: z kontaktní mapy (vektorizovaně přes np.where)
         contact_map = bs_info['contact_map']
-        n_cm = contact_map.shape[0]
-        for i in range(n_cm):
-            for j in range(n_cm):
-                if contact_map[i, j] > 0.5:
-                    all_edges.append([i, j])
-                    all_edge_types.append(EDGE_TYPE_PP)
-                    # P-P edge attr: [contact_weight, 0, 0, 0, 0]
-                    attr = [contact_map[i, j], 0.0, 0.0, 0.0, 0.0]
-                    all_edge_attr.append(attr)
+        pp_rows, pp_cols = np.where(contact_map > 0.5)
+        if len(pp_rows) > 0:
+            pp_weights = contact_map[pp_rows, pp_cols]
+            pp_edges = np.stack([pp_rows, pp_cols], axis=1)          # [E_pp, 2]
+            pp_attr = np.zeros((len(pp_rows), EDGE_ATTR_DIM))       # [E_pp, 5]
+            pp_attr[:, 0] = pp_weights
+            all_edges.extend(pp_edges.tolist())
+            all_edge_types.extend([EDGE_TYPE_PP] * len(pp_rows))
+            all_edge_attr.extend(pp_attr.tolist())
         
         # 2) P-L edges: protein-ligand interakce
         if has_ligand:
@@ -241,38 +234,36 @@ class BindingSiteGraphDataset:
     def _contact_map_to_edges(self, contact_map, threshold=0.5):
         """
         Convert contact map to edge list (P-P edges only).
+        Vektorizovaná verze pomocí np.where.
         
         Returns:
             edge_index: [2, num_edges]
             edge_attr: [num_edges, 1] (contact probability)
         """
-        n = contact_map.shape[0]
-        edge_list = []
-        edge_weights = []
+        rows, cols = np.where(contact_map > threshold)
         
-        for i in range(n):
-            for j in range(n):
-                if contact_map[i, j] > threshold:
-                    edge_list.append([i, j])
-                    edge_weights.append(contact_map[i, j])
-        
-        if len(edge_list) == 0:
+        if len(rows) == 0:
             # Fallback: fully connected
-            edge_list = [
-                [i, j] for i in range(n) for j in range(n)
-            ]
-            edge_weights = [1.0] * len(edge_list)
+            n = contact_map.shape[0]
+            rows, cols = np.meshgrid(np.arange(n), np.arange(n), indexing='ij')
+            rows, cols = rows.ravel(), cols.ravel()
+            edge_weights = np.ones(len(rows), dtype=np.float32)
+        else:
+            edge_weights = contact_map[rows, cols].astype(np.float32)
         
-        edge_index = torch.LongTensor(edge_list).t().contiguous()
+        edge_index = torch.LongTensor(np.stack([rows, cols])).contiguous()
         edge_attr = torch.FloatTensor(edge_weights).unsqueeze(1)
         
         return edge_index, edge_attr
     
     def __len__(self):
-        return len(self.graphs)
+        return len(self.data)
     
     def __getitem__(self, idx):
-        return self.graphs[idx]
+        """Lazy: sestaví graf až když ho DataLoader potřebuje."""
+        graph = self._build_single_graph(self.data[idx])
+        graph.y = torch.LongTensor([self.labels[idx]])
+        return graph
 
 
 # Create dataset

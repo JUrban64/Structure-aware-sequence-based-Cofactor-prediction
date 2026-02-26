@@ -368,6 +368,10 @@ def build_graph_dataset(binding_sites, include_ligand=True):
     """Sestaví PyG grafový dataset (protein-ligand interakční graf)."""
     from binding_site_graph import BindingSiteGraphDataset
     
+    # Labely nastavíme PŘED konstrukcí datasetu – grafy se staví lazy
+    for bs in binding_sites:
+        bs.setdefault('label', 1)
+    
     dataset = BindingSiteGraphDataset(
         binding_sites,
         feature_config={
@@ -379,11 +383,7 @@ def build_graph_dataset(binding_sites, include_ligand=True):
         include_ligand=include_ligand
     )
     
-    # Nastavit správné labely
-    for i, bs in enumerate(binding_sites):
-        dataset.graphs[i].y = torch.LongTensor([bs.get('label', 1)])
-    
-    print(f"  ✓ {len(dataset)} grafů vytvořeno")
+    print(f"  ✓ {len(dataset)} grafů připraveno (lazy building)")
     if len(dataset) > 0:
         g = dataset[0]
         print(f"    Celkem uzlů: {g.x.shape[0]} "
@@ -649,12 +649,27 @@ def _build_seq_subsets_from_loaded(loaded_splits, esm_extractor=None,
             ds = SequenceDataset(seqs, labs, emb_dir=emb_dir,
                                seq_ids=seq_ids, max_length=max_length)
         else:
-            # Fallback bez cache_dir (in-memory)
-            if esm_extractor is None and esm_model_name:
-                esm_extractor = ESMFeatureExtractor(model_name=esm_model_name)
-                esm_loaded = True
-            ds = SequenceDataset(seqs, labs, esm_extractor=esm_extractor,
-                               max_length=max_length)
+            # Fallback: vytvořit cache_dir v aktuálním adresáři
+            emb_dir = os.path.join('cache', f'seq_emb_{name}_split')
+            os.makedirs(emb_dir, exist_ok=True)
+            
+            seq_ids = [hashlib.md5(s.encode()).hexdigest()[:12] for s in seqs]
+            
+            existing = sum(1 for sid in seq_ids 
+                           if os.path.exists(os.path.join(emb_dir, f"{sid}.npy")))
+            
+            if existing < len(seqs):
+                if esm_extractor is None and esm_model_name:
+                    esm_extractor = ESMFeatureExtractor(model_name=esm_model_name)
+                    esm_loaded = True
+                if esm_extractor is not None:
+                    esm_extractor.extract_and_save_to_disk(
+                        list(zip(seq_ids, seqs)),
+                        output_dir=emb_dir,
+                        max_length=max_length
+                    )
+            ds = SequenceDataset(seqs, labs, emb_dir=emb_dir,
+                               seq_ids=seq_ids, max_length=max_length)
         
         datasets.append(ds)
     
@@ -699,12 +714,9 @@ def train_dual(config, graph_dataset, seq_dataset=None):
               f"{len(train_graphs)} train, {len(val_graphs)} val, "
               f"{len(test_graphs)} test")
     elif len(graph_dataset) >= 5:
-        # Extrahuj sekvence a labely z datasetu
-        sequences = []
-        labels = []
-        for g in graph_dataset.graphs:
-            sequences.append(g.sequence if hasattr(g, 'sequence') else '')
-            labels.append(g.y.item())
+        # Extrahuj sekvence a labely z datasetu (bez stavby grafů)
+        sequences = graph_dataset.sequences
+        labels = graph_dataset.labels
         
         identity_threshold = config.get('cluster_identity', 0.4)
         
@@ -727,8 +739,8 @@ def train_dual(config, graph_dataset, seq_dataset=None):
                        train_graphs, val_graphs, test_graphs,
                        split_type='graph', config=config)
     else:
-        train_graphs = graph_dataset.graphs
-        val_graphs = graph_dataset.graphs
+        train_graphs = list(graph_dataset)
+        val_graphs = list(graph_dataset)
         test_graphs = []
     
     # Pokud je prepare-only, netrénujeme
@@ -889,13 +901,11 @@ def train_gnn_only(config, graph_dataset):
               f"{len(train_graphs)} train, {len(val_graphs)} val, "
               f"{len(test_graphs)} test")
     elif len(graph_dataset) >= 5:
-        # Extrahuj sekvence a labely z datasetu
-        sequences = []
-        labels = []
-        for g in (graph_dataset.graphs if hasattr(graph_dataset, 'graphs') 
-                  else graph_dataset):
-            sequences.append(g.sequence if hasattr(g, 'sequence') else '')
-            labels.append(g.y.item())
+        # Extrahuj sekvence a labely z datasetu (bez stavby grafů)
+        sequences = (graph_dataset.sequences if hasattr(graph_dataset, 'sequences')
+                     else [g.sequence if hasattr(g, 'sequence') else '' for g in graph_dataset])
+        labels = (graph_dataset.labels if hasattr(graph_dataset, 'labels')
+                  else [g.y.item() for g in graph_dataset])
         
         identity_threshold = config.get('cluster_identity', 0.4)
         
@@ -917,8 +927,7 @@ def train_gnn_only(config, graph_dataset):
                        train_graphs, val_graphs, test_graphs,
                        split_type='graph', config=config)
     else:
-        train_graphs = (graph_dataset.graphs if hasattr(graph_dataset, 'graphs') 
-                       else list(graph_dataset))
+        train_graphs = list(graph_dataset)
         val_graphs = train_graphs
         test_graphs = []
     
@@ -1273,7 +1282,7 @@ def main():
         binding_sites, include_ligand=config.get('include_ligand', True)
     )
     
-    # Uvolni binding_sites – data jsou nyní v graph_dataset.graphs
+    # Binding sites zůstávají v graph_dataset.data (lazy building)
     del binding_sites
     gc.collect()
     log_memory("po uvolnění binding_sites")

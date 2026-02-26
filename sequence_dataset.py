@@ -100,10 +100,10 @@ class SequenceDataset(Dataset):
             sid = self.seq_ids[idx]
             npy_path = os.path.join(self.emb_dir, f"{sid}.npy")
             if os.path.exists(npy_path):
-                emb = np.load(npy_path)
+                emb = np.load(npy_path).astype(np.float32)
             elif self.esm_extractor is not None:
                 emb = self.esm_extractor.extract_embeddings(seq)
-                np.save(npy_path, emb)
+                np.save(npy_path, emb.astype(np.float16))
             else:
                 raise RuntimeError(
                     f"Embedding soubor {npy_path} neexistuje a "
