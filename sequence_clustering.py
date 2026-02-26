@@ -596,7 +596,7 @@ def cluster_and_split_graphs(graph_dataset, sequences, labels,
     val_graphs = [graph_dataset[i] for i in val_idx]
     test_graphs = [graph_dataset[i] for i in test_idx]
     
-    return train_graphs, val_graphs, test_graphs
+    return train_graphs, val_graphs, test_graphs, (train_idx, val_idx, test_idx)
 
 
 def cluster_and_split_sequences(seq_dataset, sequences, labels,

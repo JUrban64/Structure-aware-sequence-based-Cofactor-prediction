@@ -41,32 +41,40 @@ class BothDataset(Dataset):
     Toto umožňuje consistency loss: obě větve vidí STEJNÝ protein,
     a model penalizuje rozdíl jejich embeddingů.
     
-    ESM embeddingy se čtou z disku (lazy-loading) nebo generují on-the-fly.
+    LAZY-LOADING: grafy se staví až v __getitem__ voláním
+    graph_dataset[idx] — NIKDY se nedrží celý list v RAM.
+    ESM embeddingy se čtou z disku.
     """
     
-    def __init__(self, graphs, emb_dir, max_length=1024):
+    def __init__(self, graph_dataset, indices, emb_dir, max_length=1024):
         """
         Args:
-            graphs: list of PyG Data (trénovací grafy)
+            graph_dataset: BindingSiteGraphDataset (lazy – staví grafy v __getitem__)
+            indices: list of int – indexy do graph_dataset (trénovací subset)
             emb_dir: složka s full-sequence ESM embeddingy (.npy soubory)
             max_length: maximální délka sekvence
         """
-        self.graphs = graphs
+        self.graph_dataset = graph_dataset
+        self.indices = indices
         self.emb_dir = emb_dir
         self.max_length = max_length
         
-        # Vytvoř ID pro každý graf z full_sequence
+        # Pre-compute seq_ids z raw bs_info (BEZ stavby grafů!)
+        # graph_dataset.data je list raw dicts → full_sequence je rovnou dostupná
         self.seq_ids = []
-        for g in graphs:
-            full_seq = g.full_sequence if hasattr(g, 'full_sequence') else g.sequence
+        for i in indices:
+            bs_info = graph_dataset.data[i]
+            full_seq = bs_info.get('full_sequence',
+                                   bs_info.get('binding_site_sequence', ''))
             sid = hashlib.md5(full_seq.encode()).hexdigest()[:12]
             self.seq_ids.append(sid)
     
     def __len__(self):
-        return len(self.graphs)
+        return len(self.indices)
     
     def __getitem__(self, idx):
-        graph = self.graphs[idx]
+        # Lazy: graf se builduje TEĎ, ne dopředu
+        graph = self.graph_dataset[self.indices[idx]]
         sid = self.seq_ids[idx]
         
         # Načti full-sequence ESM embedding z disku
@@ -76,7 +84,7 @@ class BothDataset(Dataset):
         else:
             raise FileNotFoundError(
                 f"Full-seq ESM embedding nenalezen: {npy_path}. "
-                f"Spusťte precompute_both_embeddings() nejdříve."
+                f"Spusťte _build_both_loader() nejdříve."
             )
         
         # Ořízni na max_length

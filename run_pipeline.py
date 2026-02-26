@@ -687,14 +687,21 @@ def _build_seq_subsets_from_loaded(loaded_splits, esm_extractor=None,
 # ============================================================
 # BOTH LOADER – pro consistency loss (graf + full-seq ESM)
 # ============================================================
-def _build_both_loader(train_graphs, config, device):
+def _build_both_loader(graph_dataset, train_indices, config, device):
     """
     Vytvoří DataLoader pro consistency training:
     každý batch obsahuje PyG graf + full-sequence ESM embeddingy.
     
-    1. Extrahuje full_sequence z grafů
-    2. Precompute full-seq ESM embeddingy na disk (pokud chybí)
-    3. Vytvoří BothDataset + DataLoader
+    LAZY: grafy se NEDRŽÍ v RAM — BothDataset volá
+    graph_dataset[idx] až v __getitem__.
+    Sekvence pro ESM precompute se čtou z graph_dataset.data
+    (raw bs_info dicts) BEZ stavby grafů.
+    
+    Args:
+        graph_dataset: BindingSiteGraphDataset (lazy)
+        train_indices: list of int – indexy trénovacího subsetu
+        config: konfigurace pipeline
+        device: torch device
     """
     from dual_train import BothDataset, collate_both
     from torch.utils.data import DataLoader
@@ -704,12 +711,15 @@ def _build_both_loader(train_graphs, config, device):
     both_emb_dir = os.path.join(cache_dir, 'both_full_seq_emb')
     os.makedirs(both_emb_dir, exist_ok=True)
     
-    # Sesbírej unikátní full sekvence z trénovacích grafů
+    # Sesbírej unikátní full sekvence z raw bs_info (BEZ stavby grafů!)
     seq_id_map = {}  # seq_id → full_sequence
-    for g in train_graphs:
-        full_seq = g.full_sequence if hasattr(g, 'full_sequence') else g.sequence
-        sid = hashlib.md5(full_seq.encode()).hexdigest()[:12]
-        seq_id_map[sid] = full_seq
+    for i in train_indices:
+        bs_info = graph_dataset.data[i]
+        full_seq = bs_info.get('full_sequence',
+                               bs_info.get('binding_site_sequence', ''))
+        if full_seq:
+            sid = hashlib.md5(full_seq.encode()).hexdigest()[:12]
+            seq_id_map[sid] = full_seq
     
     # Zkontroluj, kolik embeddings chybí
     missing = []
@@ -737,7 +747,8 @@ def _build_both_loader(train_graphs, config, device):
               f"full-seq embeddings nalezeno v cache")
     
     both_dataset = BothDataset(
-        graphs=train_graphs,
+        graph_dataset=graph_dataset,
+        indices=train_indices,
         emb_dir=both_emb_dir,
         max_length=1024
     )
@@ -750,7 +761,7 @@ def _build_both_loader(train_graphs, config, device):
     )
     
     print(f"  ✓ Both loader: {len(both_dataset)} vzorků "
-          f"(consistency weight: {config.get('consistency_weight', 0.5)})")
+          f"(lazy, consistency weight: {config.get('consistency_weight', 0.5)})")
     
     return both_loader
 
@@ -779,6 +790,8 @@ def train_dual(config, graph_dataset, seq_dataset=None):
         loaded_seq_splits = load_splits(config['load_splits_dir'], 'sequence')
     
     # ---- Graph data split ----
+    train_indices = None  # indexy do graph_dataset (pro lazy BothDataset)
+    
     if loaded_graph_splits is not None:
         train_graphs, val_graphs, test_graphs, meta = loaded_graph_splits
         print(f"  ✓ Načtené graph splity: "
@@ -791,13 +804,14 @@ def train_dual(config, graph_dataset, seq_dataset=None):
         
         identity_threshold = config.get('cluster_identity', 0.4)
         
-        train_graphs, val_graphs, test_graphs = cluster_and_split_graphs(
+        train_graphs, val_graphs, test_graphs, split_indices = cluster_and_split_graphs(
             graph_dataset, sequences, labels,
             identity_threshold=identity_threshold,
             val_size=0.15,
             test_size=0.15,
             random_state=42
         )
+        train_indices = split_indices[0]  # pro lazy BothDataset
         
         print(f"  ✓ Cluster-based split: "
               f"{len(train_graphs)} train, {len(val_graphs)} val, "
@@ -813,6 +827,7 @@ def train_dual(config, graph_dataset, seq_dataset=None):
         train_graphs = list(graph_dataset)
         val_graphs = list(graph_dataset)
         test_graphs = []
+        train_indices = list(range(len(graph_dataset)))
     
     # Pokud je prepare-only, netrénujeme
     if config.get('prepare_only'):
@@ -930,9 +945,11 @@ def train_dual(config, graph_dataset, seq_dataset=None):
     
     # ---- Both loader (consistency loss: graf + full-seq ESM) ----
     both_loader = None
-    if config.get('consistency_weight', 0) > 0 and len(train_graphs) > 0:
+    if (config.get('consistency_weight', 0) > 0 
+            and len(train_graphs) > 0 
+            and train_indices is not None):
         both_loader = _build_both_loader(
-            train_graphs, config, device
+            graph_dataset, train_indices, config, device
         )
     
     # ---- Trainer ----
@@ -988,7 +1005,7 @@ def train_gnn_only(config, graph_dataset):
         
         identity_threshold = config.get('cluster_identity', 0.4)
         
-        train_graphs, val_graphs, test_graphs = cluster_and_split_graphs(
+        train_graphs, val_graphs, test_graphs, _ = cluster_and_split_graphs(
             graph_dataset, sequences, labels,
             identity_threshold=identity_threshold,
             val_size=0.15,

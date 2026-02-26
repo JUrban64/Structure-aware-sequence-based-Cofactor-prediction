@@ -36,3 +36,6 @@ cp *.pth $DATADIR/
 cp -r cache/ $DATADIR/ 2>/dev/null || true
 
 clean_scratch
+
+
+
