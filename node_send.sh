@@ -1,16 +1,11 @@
 #!/bin/bash
-#PBS -N TRAIN_SQ_test_18
+#PBS -N TRAIN_SQ_test_19
 #PBS -l select=1:ncpus=4:ngpus=1:mem=100gb:scratch_ssd=100gb
 #PBS -l walltime=05:00:00
 
 
 
 DATADIR=/auto/brno2/home/urbany/SeQbCoP/Structure-aware-sequence-based-Cofactor-prediction
-
-
-
-
-
 
 
 module add mambaforge
