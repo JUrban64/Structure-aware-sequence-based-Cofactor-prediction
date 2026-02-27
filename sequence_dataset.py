@@ -140,7 +140,8 @@ def collate_sequences(batch):
     """
     embeddings = [item['embeddings'] for item in batch]
     labels = torch.stack([item['label'] for item in batch])
-    lengths = [item['length'] for item in batch]
+    # Skutečná délka embeddingu (může se lišit od len(seq) kvůli ESM tokenizaci)
+    lengths = [emb.shape[0] for emb in embeddings]
     
     max_len = max(lengths)
     emb_dim = embeddings[0].size(1)
