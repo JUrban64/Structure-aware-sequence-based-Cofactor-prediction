@@ -23,11 +23,7 @@ Příklady spuštění:
   # Evaluace z test dat (malý dataset):
   python evaluate.py --test-data --mode sequence
 
-  # Predikce jedné sekvence:
-  python evaluate.py --predict "MVLSPADKTNVKAAWGKVG..."
-
-  # Predikce z FASTA souboru:
-  python evaluate.py --fasta input.fasta
+Pro predikci nových sekvencí použijte samostatný skript predict.py.
 """
 
 import os
@@ -99,12 +95,6 @@ def parse_args():
     parser.add_argument('--mode', type=str, default='all',
                         choices=['sequence', 'structure', 'both', 'all'],
                         help='Režim evaluace (default: all = obě větve zvlášť)')
-    
-    # Single prediction
-    parser.add_argument('--predict', type=str, default=None,
-                        help='Predikce pro jednu sekvenci (řetězec AA)')
-    parser.add_argument('--fasta', type=str, default=None,
-                        help='Predikce pro sekvence z FASTA souboru')
     
     # Parametry
     parser.add_argument('--batch-size', type=int, default=32)
@@ -619,103 +609,6 @@ def print_results(results, title=""):
 
 
 # ============================================================
-# Predikce jedné sekvence
-# ============================================================
-def predict_single_sequence(model, sequence, device, config):
-    from esm2_feature_ex import ESMFeatureExtractor
-    print(f"  Sekvence: {sequence[:50]}... ({len(sequence)} AA)")
-    
-    esm_extractor = ESMFeatureExtractor(model_name=config['esm_model'])
-    truncated = sequence[:config['max_length']]
-    emb = esm_extractor.extract_embeddings(truncated)
-    
-    del esm_extractor
-    if torch.cuda.is_available(): torch.cuda.empty_cache()
-    gc.collect()
-    
-    emb_tensor = torch.FloatTensor(emb).unsqueeze(0).to(device)
-    mask = torch.zeros(1, emb_tensor.shape[1], dtype=torch.bool).to(device)
-    
-    model.eval()
-    with torch.no_grad():
-        logits, _ = model(mode='sequence', esm_embeddings=emb_tensor, seq_mask=mask)
-        probs = F.softmax(logits, dim=1)
-    
-    prob_bind = probs[0, 1].item()
-    prob_no_bind = probs[0, 0].item()
-    
-    return {
-        'sequence_length': len(sequence),
-        'probability_binds': prob_bind,
-        'probability_no_bind': prob_no_bind,
-        'prediction': 'BINDS' if prob_bind >= 0.5 else 'NO BIND',
-    }
-
-
-def predict_from_fasta(model, fasta_path, device, config):
-    sequences, headers = [], []
-    current_header, current_seq = None, []
-    
-    with open(fasta_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith('>'):
-                if current_header is not None:
-                    headers.append(current_header)
-                    sequences.append(''.join(current_seq))
-                current_header = line[1:].split()[0]
-                current_seq = []
-            else:
-                current_seq.append(line)
-    
-    if current_header is not None:
-        headers.append(current_header)
-        sequences.append(''.join(current_seq))
-    
-    if not sequences:
-        print("  ⚠ FASTA soubor neobsahuje žádné sekvence")
-        return []
-    
-    print(f"  Načteno {len(sequences)} sekvencí z {fasta_path}")
-    
-    from esm2_feature_ex import ESMFeatureExtractor
-    esm_extractor = ESMFeatureExtractor(model_name=config['esm_model'])
-    
-    results = []
-    model.eval()
-    
-    for i, (header, seq) in enumerate(zip(headers, sequences)):
-        truncated = seq[:config['max_length']]
-        emb = esm_extractor.extract_embeddings(truncated)
-        
-        emb_tensor = torch.FloatTensor(emb).unsqueeze(0).to(device)
-        mask = torch.zeros(1, emb_tensor.shape[1], dtype=torch.bool).to(device)
-        
-        with torch.no_grad():
-            logits, _ = model(mode='sequence', esm_embeddings=emb_tensor, seq_mask=mask)
-            probs = F.softmax(logits, dim=1)
-        
-        prob_bind = probs[0, 1].item()
-        
-        results.append({
-            'id': header,
-            'length': len(seq),
-            'probability_binds': prob_bind,
-            'prediction': 'BINDS' if prob_bind >= 0.5 else 'NO BIND',
-            "prediction_binary": 1 if prob_bind >= 0.5 else 0
-        })
-        
-        if (i + 1) % 10 == 0:
-            print(f"  Zpracováno {i+1}/{len(sequences)}")
-    
-    del esm_extractor
-    if torch.cuda.is_available(): torch.cuda.empty_cache()
-    gc.collect()
-    
-    return results
-
-
-# ============================================================
 # MAIN
 # ============================================================
 def main():
@@ -747,46 +640,6 @@ def main():
     
     model = load_model(args.model_path, config, device)
     
-    # ---- Režim: single prediction ----
-    if args.predict:
-        result = predict_single_sequence(model, args.predict, device, config)
-        print(f"\n  Predikce: {result['prediction']}")
-        print(f"  P(binds {config['ligand_name']}): {result['probability_binds']:.4f}")
-        print(f"  P(no bind): {result['probability_no_bind']:.4f}")
-        
-        if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(result, f, indent=2)
-            print(f"  Výsledek uložen do {args.output}")
-        return
-    
-    # ---- Režim: FASTA prediction ----
-    if args.fasta:
-        if not os.path.exists(args.fasta):
-            print(f"\n  ✗ FASTA soubor nenalezen: {args.fasta}")
-            sys.exit(1)
-        
-        results = predict_from_fasta(model, args.fasta, device, config)
-        
-        print(f"\n{'='*60}")
-        print(f"  Výsledky predikce ({len(results)} sekvencí)")
-        print(f"{'='*60}")
-        print(f"  {'ID':<30} {'Délka':>6}  {'P(bind)':>8}  {'Predikce':<10}")
-        print(f"  {'-'*30} {'-'*6}  {'-'*8}  {'-'*10}")
-        
-        for r in results:
-            print(f"  {r['id']:<30} {r['length']:>6}  "
-                  f"{r['probability_binds']:>8.4f}  {r['prediction']:<10}")
-        
-        n_bind = sum(1 for r in results if r['prediction'] == 'BINDS')
-        print(f"\n  Celkem: {n_bind}/{len(results)} predikováno jako BINDS")
-        
-        if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(results, f, indent=2)
-            print(f"  Výsledky uloženy do {args.output}")
-        return
-    
     # ---- Načtení testovacích dat ----
     test_graphs = None
     test_seq_dataset = None
@@ -810,7 +663,7 @@ def main():
     else:
         print("\n  ⚠ Nebyl zadán zdroj testovacích dat.")
         print("    Použijte --load-splits, --test-data, --seq-positive-csv/--seq-negative-csv")
-        print("    nebo --predict / --fasta pro predikci jednotlivých sekvencí.")
+        print("    Pro predikci nových sekvencí použijte predict.py")
         sys.exit(1)
     
     # ---- Evaluace ----
