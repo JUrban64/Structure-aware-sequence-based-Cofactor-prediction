@@ -115,7 +115,15 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--ligand', type=str, default='NAD')
     parser.add_argument('--no-seq', action='store_true',
-                        help='Trénovat pouze na PDB (bez sequence branch)')
+                        help='Trénovat pouze GNN na PDB (bez sequence branch, '
+                             'uloží best_gnn_only_model.pth)')
+    parser.add_argument('--seq-only', action='store_true',
+                        help='Trénovat POUZE sequence branch (bez PDB grafů). '
+                             'Používá sekvence z CSV. Uloží best_seq_only_model.pth')
+    parser.add_argument('--struct-only', action='store_true',
+                        help='Trénovat dual model POUZE na PDB datech (grafy + '
+                             'jejich sekvence, bez externích UniProt sekvencí). '
+                             'Uloží best_struct_only_model.pth')
     parser.add_argument('--test-data', action='store_true',
                         help='Použít malý testovací dataset (data/NAD/test/) '
                              'pro ověření funkčnosti celého pipeline '
@@ -797,6 +805,9 @@ def train_dual(config, graph_dataset, seq_dataset=None):
         print(f"  ✓ Načtené graph splity: "
               f"{len(train_graphs)} train, {len(val_graphs)} val, "
               f"{len(test_graphs)} test")
+        # Rekonstruuj train_indices pro both_loader (consistency loss)
+        # Potřebujeme mapování načtených grafů zpět na indexy v graph_dataset
+        train_indices = list(range(len(train_graphs)))  # fallback: treat as sequential
     elif len(graph_dataset) >= 5:
         # Extrahuj sekvence a labely z datasetu (bez stavby grafů)
         sequences = graph_dataset.sequences
@@ -976,6 +987,379 @@ def train_dual(config, graph_dataset, seq_dataset=None):
     return model
 
 
+# ============================================================
+# SEQUENCE-ONLY TRÉNINK
+# ============================================================
+def train_seq_only(config, seq_dataset):
+    """
+    Trénink POUZE sequence branch (bez PDB grafů).
+    
+    Používá DualBranchPredictor, ale trénuje jen sekvenční větev.
+    Model se uloží jako best_seq_only_model.pth.
+    Vhodné pro porovnání s dual/struct modely.
+    """
+    from dual_predictor import DualBranchPredictor
+    from dual_train import DualTrainer
+    from sequence_dataset import collate_sequences
+    from torch.utils.data import DataLoader, Subset
+    from sequence_clustering import cluster_and_split_sequences
+    
+    device = config['device']
+    print(f"  Device: {device}")
+    
+    identity_threshold = config.get('cluster_identity', 0.4)
+    
+    # ---- Sekvenční split ----
+    seq_train_loader = None
+    seq_val_loader = None
+    
+    loaded_seq_splits = None
+    if config.get('load_splits_dir'):
+        print(f"  Načítám sekvenční splity z: {config['load_splits_dir']}")
+        loaded_seq_splits = load_splits(config['load_splits_dir'], 'sequence')
+    
+    if loaded_seq_splits is not None:
+        seq_train_ds, seq_val_ds, seq_test_ds = _build_seq_subsets_from_loaded(
+            loaded_seq_splits,
+            esm_model_name=config['esm_model'],
+            cache_dir=config['cache_dir'],
+            max_length=512
+        )
+        
+        if seq_train_ds is not None:
+            seq_train_loader = DataLoader(
+                seq_train_ds, batch_size=config['batch_size_seq'],
+                shuffle=True, collate_fn=collate_sequences
+            )
+        if seq_val_ds is not None:
+            seq_val_loader = DataLoader(
+                seq_val_ds, batch_size=config['batch_size_seq'],
+                collate_fn=collate_sequences
+            )
+        
+        n_train = len(seq_train_ds) if seq_train_ds else 0
+        n_val = len(seq_val_ds) if seq_val_ds else 0
+        n_test = len(seq_test_ds) if seq_test_ds else 0
+        print(f"  Sekvence (načtené): {n_train} train, {n_val} val, {n_test} test")
+    
+    elif seq_dataset is not None and len(seq_dataset) > 0:
+        seq_sequences = [seq_dataset.sequences[i] for i in range(len(seq_dataset))]
+        seq_labels = [seq_dataset.labels[i] for i in range(len(seq_dataset))]
+        
+        seq_train, seq_val, seq_test = cluster_and_split_sequences(
+            seq_dataset, seq_sequences, seq_labels,
+            identity_threshold=identity_threshold,
+            val_size=0.15,
+            test_size=0.15,
+            random_state=42
+        )
+        
+        seq_train_loader = DataLoader(
+            seq_train, batch_size=config['batch_size_seq'],
+            shuffle=True, collate_fn=collate_sequences
+        )
+        seq_val_loader = DataLoader(
+            seq_val, batch_size=config['batch_size_seq'],
+            collate_fn=collate_sequences
+        )
+        
+        print(f"  Sekvence: {len(seq_train)} train, {len(seq_val)} val, "
+              f"{len(seq_test)} test")
+        
+        # Ulož sekvenční splity
+        if config.get('save_splits_dir'):
+            save_splits(config['save_splits_dir'],
+                       seq_train, seq_val, seq_test,
+                       split_type='sequence', config=config)
+    else:
+        print("  ❌ Žádný sekvenční dataset pro seq-only trénink!")
+        return None
+    
+    if seq_train_loader is None:
+        print("  ❌ Nedostatek sekvenčních dat pro trénink")
+        return None
+    
+    # Pokud je prepare-only, netrénujeme
+    if config.get('prepare_only'):
+        print("\n  ✓ Prepare-only režim – datasety připraveny, trénink přeskočen.")
+        return None
+    
+    # ---- Model (DualBranchPredictor – trénuje se jen seq branch) ----
+    model = DualBranchPredictor(
+        esm_dim=config['esm_dim'],
+        node_dim=config['node_dim'],
+        hidden_dim=config['hidden_dim'],
+        num_gnn_layers=config['num_gnn_layers'],
+        num_attention_heads=config['num_attention_heads'],
+        dropout=config['dropout'],
+        use_gat=config['use_gat'],
+        ligand_dim=config.get('ligand_dim', 36),
+        esm_compress_dim=config.get('esm_compress_dim', 64)
+    )
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    seq_params = sum(p.numel() for p in model.seq_branch.parameters())
+    cls_params = sum(p.numel() for p in model.classifier.parameters())
+    print(f"  Model: {total_params:,} celkem parametrů")
+    print(f"    Seq branch: {seq_params:,}, Classifier: {cls_params:,}")
+    print(f"    (GNN branch existuje, ale nebude trénován)")
+    
+    # ---- Trainer (graph_train_loader = None → trénuje jen seq branch) ----
+    trainer = DualTrainer(
+        model=model,
+        graph_train_loader=None,   # Žádné grafy
+        graph_val_loader=None,     # Žádné grafy
+        seq_train_loader=seq_train_loader,
+        seq_val_loader=seq_val_loader,
+        device=device,
+        lr=config['lr'],
+        consistency_weight=0.0,    # Bez consistency (nemáme grafy)
+        struct_weight=0.0,
+        seq_weight=config.get('seq_weight', 1.0)
+    )
+    
+    # ---- Trénink ----
+    trainer.train(
+        num_epochs=config['num_epochs'],
+        both_loader=None,          # Žádný consistency loader
+        patience=config.get('early_stopping_patience', 10),
+        model_name='best_seq_only_model.pth'
+    )
+    
+    return model
+
+
+# ============================================================
+# STRUCT-ONLY TRÉNINK (PDB grafy + jejich sekvence, bez externích CSV)
+# ============================================================
+def train_struct_with_own_seq(config, graph_dataset):
+    """
+    Trénink dual modelu POUZE na PDB datech.
+    
+    Používá:
+      - GNN branch: grafy z PDB struktur
+      - Seq branch: sekvence extrahované z TĚCH SAMÝCH PDB (ne UniProt CSV)
+      - Consistency loss: zarovnání obou větví na stejných proteinech
+    
+    Model se uloží jako best_struct_only_model.pth.
+    Vhodné pro porovnání: jak moc pomáhají externí sekvence.
+    """
+    from dual_predictor import DualBranchPredictor
+    from dual_train import DualTrainer, BothDataset, collate_both
+    from sequence_dataset import SequenceDataset, collate_sequences
+    from torch.utils.data import DataLoader, Subset
+    from torch_geometric.loader import DataLoader as PyGDataLoader
+    from sequence_clustering import ClusterSplitter, cluster_and_split_graphs
+    from esm2_feature_ex import ESMFeatureExtractor
+    import hashlib
+    
+    device = config['device']
+    print(f"  Device: {device}")
+    
+    identity_threshold = config.get('cluster_identity', 0.4)
+    
+    # ---- Graph data split ----
+    train_indices = None
+    
+    loaded_graph_splits = None
+    if config.get('load_splits_dir'):
+        print(f"  Načítám graph splity z: {config['load_splits_dir']}")
+        loaded_graph_splits = load_splits(config['load_splits_dir'], 'graph')
+    
+    if loaded_graph_splits is not None:
+        train_graphs, val_graphs, test_graphs, meta = loaded_graph_splits
+        print(f"  ✓ Načtené graph splity: "
+              f"{len(train_graphs)} train, {len(val_graphs)} val, "
+              f"{len(test_graphs)} test")
+        train_indices = list(range(len(train_graphs)))
+    elif len(graph_dataset) >= 5:
+        sequences = graph_dataset.sequences
+        labels = graph_dataset.labels
+        
+        train_graphs, val_graphs, test_graphs, split_indices = cluster_and_split_graphs(
+            graph_dataset, sequences, labels,
+            identity_threshold=identity_threshold,
+            val_size=0.15,
+            test_size=0.15,
+            random_state=42
+        )
+        train_indices = split_indices[0]
+        
+        print(f"  ✓ Cluster-based split: "
+              f"{len(train_graphs)} train, {len(val_graphs)} val, "
+              f"{len(test_graphs)} test")
+        
+        if config.get('save_splits_dir'):
+            save_splits(config['save_splits_dir'],
+                       train_graphs, val_graphs, test_graphs,
+                       split_type='graph', config=config)
+    else:
+        train_graphs = list(graph_dataset)
+        val_graphs = list(graph_dataset)
+        test_graphs = []
+        train_indices = list(range(len(graph_dataset)))
+    
+    if config.get('prepare_only'):
+        print("\n  ✓ Prepare-only režim – datasety připraveny, trénink přeskočen.")
+        return None
+    
+    # ---- Graph loaders ----
+    graph_train_loader = PyGDataLoader(
+        train_graphs, batch_size=config['batch_size_graph'], shuffle=True
+    )
+    graph_val_loader = PyGDataLoader(
+        val_graphs, batch_size=config['batch_size_graph']
+    )
+    
+    print(f"  Grafy: {len(train_graphs)} train, {len(val_graphs)} val")
+    
+    # ---- Extrahuj sekvence z PDB dat pro sekvenční větev ----
+    # Místo externích UniProt sekvencí: sekvence přímo z PDB struktur
+    print(f"\n  Extrakce sekvencí z PDB pro sequence branch...")
+    
+    pdb_sequences = []
+    pdb_labels = []
+    pdb_seq_ids = []
+    
+    # Sesbírej sekvence ZE VŠECH binding sites (ne jen train)
+    for i, bs_info in enumerate(graph_dataset.data):
+        full_seq = bs_info.get('full_sequence',
+                               bs_info.get('binding_site_sequence', ''))
+        if full_seq and len(full_seq) > 0:
+            pdb_sequences.append(full_seq)
+            pdb_labels.append(bs_info.get('label', 1))
+            sid = hashlib.md5(full_seq.encode()).hexdigest()[:12]
+            pdb_seq_ids.append(sid)
+    
+    print(f"  Nalezeno {len(pdb_sequences)} sekvencí z PDB struktur")
+    
+    if len(pdb_sequences) == 0:
+        print("  ⚠ Žádné sekvence z PDB – trénuji jen GNN")
+        # Fallback na GNN-only
+        return train_gnn_only(config, graph_dataset)
+    
+    # ESM embeddingy pro PDB sekvence
+    emb_dir = os.path.join(config['cache_dir'], 'struct_only_seq_emb')
+    os.makedirs(emb_dir, exist_ok=True)
+    
+    existing = sum(1 for sid in pdb_seq_ids
+                   if os.path.exists(os.path.join(emb_dir, f"{sid}.npy")))
+    
+    if existing < len(pdb_sequences):
+        missing = len(pdb_sequences) - existing
+        print(f"  {existing}/{len(pdb_sequences)} embeddingů na disku, "
+              f"chybí {missing} → spouštím ESM extrakci")
+        esm = ESMFeatureExtractor(model_name=config['esm_model'])
+        esm.extract_and_save_to_disk(
+            list(zip(pdb_seq_ids, pdb_sequences)),
+            output_dir=emb_dir,
+            max_length=512
+        )
+        del esm
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+    else:
+        print(f"  ✓ Všech {existing} embeddingů nalezeno na disku")
+    
+    # SequenceDataset z PDB sekvencí
+    pdb_seq_dataset = SequenceDataset(
+        pdb_sequences, pdb_labels,
+        emb_dir=emb_dir,
+        seq_ids=pdb_seq_ids,
+        max_length=512
+    )
+    
+    # Split PDB sekvencí podle stejných indexů jako grafy
+    # (aby train/val/test odpovídaly grafovému splitu)
+    if loaded_graph_splits is not None:
+        # Načtené splity – rozděl sekvence jednoduše na stejné proporce
+        n_total = len(pdb_seq_dataset)
+        n_train = int(n_total * 0.7)
+        n_val = int(n_total * 0.15)
+        seq_train = Subset(pdb_seq_dataset, list(range(n_train)))
+        seq_val = Subset(pdb_seq_dataset, list(range(n_train, n_train + n_val)))
+    elif train_indices is not None:
+        # Použij stejné indexy jako pro grafy
+        all_indices = set(range(len(pdb_seq_dataset)))
+        train_idx_set = set(train_indices)
+        # Val indexy: z grafového splitu
+        val_indices_guess = [i for i in all_indices if i not in train_idx_set]
+        # Rozděl na val a test
+        n_val_target = max(1, len(val_indices_guess) // 2)
+        val_indices = val_indices_guess[:n_val_target]
+        
+        seq_train = Subset(pdb_seq_dataset, list(train_idx_set))
+        seq_val = Subset(pdb_seq_dataset, val_indices)
+    else:
+        # Fallback: random split
+        from sklearn.model_selection import train_test_split
+        indices = list(range(len(pdb_seq_dataset)))
+        train_idx, val_idx = train_test_split(indices, test_size=0.2, random_state=42)
+        seq_train = Subset(pdb_seq_dataset, train_idx)
+        seq_val = Subset(pdb_seq_dataset, val_idx)
+    
+    seq_train_loader = DataLoader(
+        seq_train, batch_size=config['batch_size_seq'],
+        shuffle=True, collate_fn=collate_sequences
+    )
+    seq_val_loader = DataLoader(
+        seq_val, batch_size=config['batch_size_seq'],
+        collate_fn=collate_sequences
+    )
+    
+    print(f"  PDB sekvence: {len(seq_train)} train, {len(seq_val)} val")
+    
+    # ---- Model ----
+    model = DualBranchPredictor(
+        esm_dim=config['esm_dim'],
+        node_dim=config['node_dim'],
+        hidden_dim=config['hidden_dim'],
+        num_gnn_layers=config['num_gnn_layers'],
+        num_attention_heads=config['num_attention_heads'],
+        dropout=config['dropout'],
+        use_gat=config['use_gat'],
+        ligand_dim=config.get('ligand_dim', 36),
+        esm_compress_dim=config.get('esm_compress_dim', 64)
+    )
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Model: {total_params:,} parametrů")
+    
+    # ---- Both loader (consistency loss) ----
+    both_loader = None
+    if (config.get('consistency_weight', 0) > 0
+            and len(train_graphs) > 0
+            and train_indices is not None):
+        both_loader = _build_both_loader(
+            graph_dataset, train_indices, config, device
+        )
+    
+    # ---- Trainer ----
+    trainer = DualTrainer(
+        model=model,
+        graph_train_loader=graph_train_loader,
+        graph_val_loader=graph_val_loader,
+        seq_train_loader=seq_train_loader,
+        seq_val_loader=seq_val_loader,
+        device=device,
+        lr=config['lr'],
+        consistency_weight=config['consistency_weight'],
+        struct_weight=config.get('struct_weight', 5.0),
+        seq_weight=config.get('seq_weight', 1.0)
+    )
+    
+    # ---- Trénink ----
+    trainer.train(
+        num_epochs=config['num_epochs'],
+        both_loader=both_loader,
+        patience=config.get('early_stopping_patience', 10),
+        model_name='best_struct_only_model.pth'
+    )
+    
+    return model
+
+
 def train_gnn_only(config, graph_dataset):
     """Trénink pouze GNN (bez sequence branch)."""
     from binding_site_predictor import BindingSiteNADPredictor
@@ -996,6 +1380,9 @@ def train_gnn_only(config, graph_dataset):
         print(f"  ✓ Načtené graph splity: "
               f"{len(train_graphs)} train, {len(val_graphs)} val, "
               f"{len(test_graphs)} test")
+        # Rekonstruuj train_indices pro both_loader (consistency loss)
+        # Potřebujeme mapování načtených grafů zpět na indexy v graph_dataset
+        train_indices = list(range(len(train_graphs)))  # fallback: treat as sequential
     elif len(graph_dataset) >= 5:
         # Extrahuj sekvence a labely z datasetu (bez stavby grafů)
         sequences = (graph_dataset.sequences if hasattr(graph_dataset, 'sequences')
@@ -1270,6 +1657,46 @@ def main():
         run_test(config)
         return
     
+    # ---- Seq-only režim: přeskoč PDB zpracování ----
+    if args.seq_only:
+        print("=" * 60)
+        print("SQBCP – Sequence-Only Trénovací Pipeline")
+        print("=" * 60)
+        print(f"Device: {config['device']}")
+        print(f"Ligand: {config['ligand_name']}")
+        print(f"Seq positive: {config.get('seq_positive_csv', 'N/A')}")
+        print(f"Seq negative: {config.get('seq_negative_csv', 'N/A')}")
+        
+        print(f"\n{'='*60}")
+        print("[KROK 1/2] Sekvenční dataset")
+        print(f"{'='*60}")
+        
+        seq_result = load_sequence_data(config)
+        if seq_result is None:
+            print("❌ Žádné sekvenční data nenalezena!")
+            return
+        seq_dataset, esm_extractor = seq_result
+        
+        # Uvolni ESM
+        if esm_extractor is not None:
+            del esm_extractor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+        
+        print(f"\n{'='*60}")
+        print("[KROK 2/2] Trénink (sequence-only)")
+        print(f"{'='*60}")
+        print("  Režim: Sequence-only (pouze sekvenční větev)")
+        
+        model = train_seq_only(config, seq_dataset)
+        
+        print(f"\n{'='*60}")
+        print("✅ TRÉNINK DOKONČEN")
+        print(f"{'='*60}")
+        print(f"Model uložen jako best_seq_only_model.pth")
+        return
+    
     print("=" * 60)
     print("SQBCP – Trénovací Pipeline")
     print("=" * 60)
@@ -1385,14 +1812,19 @@ def main():
     
     # ---- KROK 4: Sekvenční dataset (volitelné) ----
     seq_dataset = None
-    if not args.no_seq:
+    if not args.no_seq and not args.struct_only:
         print(f"\n{'='*60}")
-        print("[KROK 4/5] Sekvenční dataset")
+        print("[KROK 4/5] Sekvenční dataset (UniProt)")
         print(f"{'='*60}")
         
         # Sdílíme ESM instanci z kroku 2 (pokud existuje) → bez opakovaného načítání
         seq_dataset, esm_extractor = load_sequence_data(config, esm_extractor)
         log_memory("po načtení sekvenčního datasetu")
+    elif args.struct_only:
+        print(f"\n{'='*60}")
+        print("[KROK 4/5] Přeskočeno (struct-only: sekvence z PDB)")
+        print(f"{'='*60}")
+        print("  Sekvence budou extrahovány z PDB struktur (ne z UniProt CSV)")
     
     # Uvolni ESM model – už není potřeba (oba kroky dokončeny)
     if esm_extractor is not None:
@@ -1409,9 +1841,12 @@ def main():
     print("[KROK 5/5] Trénink modelu")
     print(f"{'='*60}")
     
-    if args.no_seq or seq_dataset is None:
+    if args.no_seq or (seq_dataset is None and not args.struct_only):
         print("  Režim: GNN-only (bez sequence branch)")
         model = train_gnn_only(config, graph_dataset)
+    elif args.struct_only:
+        print("  Režim: Struct-only (GNN + seq větev z PDB sekvencí)")
+        model = train_struct_with_own_seq(config, graph_dataset)
     else:
         print("  Režim: Dual-branch (GNN + Sequence)")
         model = train_dual(config, graph_dataset, seq_dataset)
@@ -1419,7 +1854,12 @@ def main():
     print(f"\n{'='*60}")
     print("✅ TRÉNINK DOKONČEN")
     print(f"{'='*60}")
-    print(f"Model uložen jako best_model.pth / best_dual_model.pth")
+    if args.no_seq:
+        print(f"Model uložen jako best_model.pth")
+    elif args.struct_only:
+        print(f"Model uložen jako best_struct_only_model.pth")
+    else:
+        print(f"Model uložen jako best_dual_model.pth")
 
 
 if __name__ == '__main__':

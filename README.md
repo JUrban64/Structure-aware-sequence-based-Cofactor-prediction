@@ -105,6 +105,18 @@ python run_pipeline.py --ligand NAD --epochs 100
 python run_pipeline.py --no-seq
 ```
 
+### Sequence-only (no PDB structures needed)
+```bash
+python run_pipeline.py --seq-only --ligand NAD --epochs 100
+```
+Trains only the sequence branch of DualBranchPredictor. Saves `best_seq_only_model.pth`.
+
+### Structure-only (PDB + their sequences, no external UniProt)
+```bash
+python run_pipeline.py --struct-only --ligand NAD --epochs 100
+```
+Trains dual model but only on PDB-derived data (graphs + sequences from PDB structures). Saves `best_struct_only_model.pth`.
+
 ### Prepare datasets without training
 ```bash
 python run_pipeline.py --save-splits ./splits --prepare-only
@@ -125,7 +137,9 @@ python run_pipeline.py --load-splits ./splits
 | `--epochs` | `100` | Training epochs |
 | `--batch-size` | `32` | Graph batch size |
 | `--lr` | `0.001` | Learning rate |
-| `--no-seq` | — | GNN-only mode |
+| `--no-seq` | — | GNN-only mode (no sequence branch) |
+| `--seq-only` | — | Sequence-only mode (no PDB, saves `best_seq_only_model.pth`) |
+| `--struct-only` | — | Struct-only mode (PDB + their sequences, saves `best_struct_only_model.pth`) |
 | `--esm-model` | `facebook/esm2_t33_650M_UR50D` | ESM-2 model |
 | `--cluster-identity` | `0.4` | Sequence identity threshold for split (0.3–0.9) |
 | `--save-splits` | — | Save train/val/test splits to directory |
@@ -133,6 +147,27 @@ python run_pipeline.py --load-splits ./splits
 | `--load-splits` | — | Load pre-saved splits instead of re-clustering |
 | `--pdb-dir` | auto | Override positive PDB directory |
 | `--pdb-neg-dir` | auto | Override negative PDB directory |
+
+### Evaluation
+
+```bash
+# Full evaluation with plots and CSV metadata
+python evaluate.py --load-splits splits/ --mode all --plot-dir plots/ \
+    --csv-output predictions.csv --output results.json
+
+# Evaluate sequence-only model
+python evaluate.py --model-path best_seq_only_model.pth --load-splits splits/ \
+    --mode sequence --csv-output seq_predictions.csv
+
+# Evaluate struct-only model
+python evaluate.py --model-path best_struct_only_model.pth --load-splits splits/ \
+    --mode all --csv-output struct_predictions.csv
+
+# Predict from FASTA
+python evaluate.py --fasta input.fasta --output results.json
+```
+
+CSV output columns: `branch, id, true_label, pred_label, pred_prob`
 
 ---
 
@@ -151,6 +186,7 @@ dual_predictor.py           Dual-branch model (GNNBranch + SequenceBranch)
 dual_train.py               Dual-branch trainer
 binding_site_predictor.py   GNN-only model
 train.py                    GNN-only trainer
+evaluate.py                 Model evaluation + CSV metadata export
 visualize_graph.py          Graph visualization
 ```
 

@@ -216,13 +216,13 @@ class DualTrainer:
         total = 0
         n_batches = 0
         
-        # Iterátory
-        seq_iter = iter(self.seq_train_loader)
-        graph_iter = iter(self.graph_train_loader)
+        # Iterátory (None loader = přeskočit danou větev)
+        seq_iter = iter(self.seq_train_loader) if self.seq_train_loader else None
+        graph_iter = iter(self.graph_train_loader) if self.graph_train_loader else None
         
         # Střídáme: sequence batch, graph batch, sequence batch, ...
-        seq_done = False
-        graph_done = False
+        seq_done = (seq_iter is None)
+        graph_done = (graph_iter is None)
         
         while not (seq_done and graph_done):
             # ---- Sequence batch ----
@@ -489,7 +489,8 @@ class DualTrainer:
         
         return results
     
-    def train(self, num_epochs=100, both_loader=None, patience=10):
+    def train(self, num_epochs=100, both_loader=None, patience=10,
+              model_name='best_dual_model.pth'):
         """
         Hlavní trénovací smyčka s early stopping a cosine annealing LR.
         
@@ -497,6 +498,7 @@ class DualTrainer:
             num_epochs: maximální počet epoch
             both_loader: volitelný loader pro consistency training
             patience: počet epoch bez zlepšení AUC pro early stopping
+            model_name: název souboru pro uložení nejlepšího modelu
         """
         best_auc = 0
         best_val_loss = float('inf')
@@ -556,8 +558,8 @@ class DualTrainer:
             if val_auc > best_auc:
                 best_auc = val_auc
                 no_improve = 0
-                torch.save(self.model.state_dict(), 'best_dual_model.pth')
-                print(f"  → New best AUC: {best_auc:.4f} (model uložen)")
+                torch.save(self.model.state_dict(), model_name)
+                print(f"  → New best AUC: {best_auc:.4f} (model uložen jako {model_name})")
             else:
                 no_improve += 1
                 print(f"  (no improvement {no_improve}/{patience})")
@@ -570,9 +572,9 @@ class DualTrainer:
         
         # Načti nejlepší model zpět
         try:
-            self.model.load_state_dict(torch.load('best_dual_model.pth',
+            self.model.load_state_dict(torch.load(model_name,
                                                    map_location=self.device))
-            print("  Best model loaded back.")
+            print(f"  Best model loaded back from {model_name}.")
         except FileNotFoundError:
             pass
 

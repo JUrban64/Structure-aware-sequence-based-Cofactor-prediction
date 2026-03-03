@@ -11,14 +11,14 @@ Podporuje tři režimy:
   3. Both           – obě větve dohromady
 
 Příklady spuštění:
-  # Evaluace na sekvenčním testu z uložených splitů:
-  python evaluate.py --load-splits splits/ --mode sequence
+  # Evaluace na sekvenčním testu z uložených splitů a uložení grafů:
+  python evaluate.py --load-splits splits/ --mode sequence --plot-dir plots/
 
   # Evaluace na grafovém testu z uložených splitů:
-  python evaluate.py --load-splits splits/ --mode structure
+  python evaluate.py --load-splits splits/ --mode structure --plot-dir plots/
 
-  # Evaluace obou větví:
-  python evaluate.py --load-splits splits/ --mode all
+  # Evaluace obou větví a uložení výsledků i grafů:
+  python evaluate.py --load-splits splits/ --mode all --output results.json --plot-dir plots/
 
   # Evaluace z test dat (malý dataset):
   python evaluate.py --test-data --mode sequence
@@ -40,6 +40,7 @@ import json
 import torch
 import torch.nn.functional as F
 import numpy as np
+import matplotlib.pyplot as plt  # PŘIDÁNO: import pro grafy
 from pathlib import Path
 from sklearn.metrics import (
     roc_auc_score, f1_score, average_precision_score,
@@ -115,6 +116,15 @@ def parse_args():
     parser.add_argument('--output', type=str, default=None,
                         help='Uložit výsledky do JSON souboru')
     
+    # CSV metadata
+    parser.add_argument('--csv-output', type=str, default=None,
+                        help='Uložit per-sample predikce do CSV souboru '
+                             '(sloupce: id, true_label, pred_label, pred_prob)')
+    
+    # PŘIDÁNO: Složka pro uložení grafů
+    parser.add_argument('--plot-dir', type=str, default=None,
+                        help='Složka pro uložení vykreslených grafů (ROC a PR)')
+    
     return parser.parse_args()
 
 
@@ -154,12 +164,6 @@ def load_model(model_path, config, device):
 # Načtení testovacích dat
 # ============================================================
 def load_test_sequences_from_splits(splits_dir, config, device):
-    """
-    Načte sekvenční testovací data z uložených splitů.
-    
-    Returns:
-        SequenceDataset nebo None
-    """
     from run_pipeline import load_splits, _build_seq_subsets_from_loaded
     
     loaded = load_splits(splits_dir, split_type='sequence')
@@ -182,25 +186,17 @@ def load_test_sequences_from_splits(splits_dir, config, device):
     
     print(f"  Test sekvencí: {n_test}")
     
-    # Vytvoř SequenceDataset pro testovací data
-    # Používáme _build_seq_subsets_from_loaded, ale vezmeme jen test split
     datasets = _build_seq_subsets_from_loaded(
-        ([], [], test_data),  # train a val prázdné, máme jen test
+        ([], [], test_data), 
         esm_model_name=config['esm_model'],
         cache_dir=config['cache_dir'],
         max_length=config['max_length']
     )
     
-    return datasets[2]  # test dataset
+    return datasets[2]
 
 
 def load_test_graphs_from_splits(splits_dir):
-    """
-    Načte grafové testovací data z uložených splitů.
-    
-    Returns:
-        list of PyG Data objects nebo None
-    """
     from run_pipeline import load_splits
     
     loaded = load_splits(splits_dir, split_type='graph')
@@ -219,16 +215,10 @@ def load_test_graphs_from_splits(splits_dir):
 
 
 def load_test_data_from_dir(config, device):
-    """
-    Načte testovací data přímo ze souborů (data/NAD/test/).
-    Kompletní pipeline: PDB → binding sites → ESM → grafy + sekvence.
-    """
     from run_pipeline import extract_binding_sites
     from esm2_feature_ex import ESMFeatureExtractor
     from binding_site_graph import BindingSiteGraphDataset
-    from sequence_dataset import (
-        SequenceDataset, load_sequences_from_separate_csvs
-    )
+    from sequence_dataset import SequenceDataset, load_sequences_from_separate_csvs
     
     ligand = config['ligand_name']
     test_base = os.path.join(BASE_DIR, 'data', ligand, 'test')
@@ -256,10 +246,7 @@ def load_test_data_from_dir(config, device):
             binding_sites.extend(bs_neg)
         
         if binding_sites:
-            # ESM embeddingy pro binding sites
-            esm_extractor = ESMFeatureExtractor(
-                model_name=config['esm_model']
-            )
+            esm_extractor = ESMFeatureExtractor(model_name=config['esm_model'])
             
             for bs in binding_sites:
                 if 'esm_embeddings' not in bs or bs['esm_embeddings'] is None:
@@ -281,25 +268,18 @@ def load_test_data_from_dir(config, device):
             print(f"  Test grafů (z PDB): {len(test_graphs)}")
             
             del esm_extractor
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
             gc.collect()
     
     # ---- Sekvenční data ----
-    seq_pos = os.path.join(test_base, 'sequences', 'positive',
-                           'NAD_only_dataset.csv')
-    seq_neg = os.path.join(test_base, 'sequences', 'negative',
-                           'NO_cofa_15000_id0.csv')
+    seq_pos = os.path.join(test_base, 'sequences', 'positive', 'NAD_only_dataset.csv')
+    seq_neg = os.path.join(test_base, 'sequences', 'negative', 'NO_cofa_15000_id0.csv')
     
     if os.path.exists(seq_pos) or os.path.exists(seq_neg):
         if os.path.exists(seq_pos) and os.path.exists(seq_neg):
-            sequences, labels = load_sequences_from_separate_csvs(
-                seq_pos, seq_neg, cofactor_filter=ligand
-            )
+            sequences, labels = load_sequences_from_separate_csvs(seq_pos, seq_neg, cofactor_filter=ligand)
         elif os.path.exists(seq_pos):
-            sequences, labels = load_sequences_from_separate_csvs(
-                seq_pos, None, cofactor_filter=ligand
-            )
+            sequences, labels = load_sequences_from_separate_csvs(seq_pos, None, cofactor_filter=ligand)
         else:
             sequences, labels = [], []
         
@@ -309,28 +289,20 @@ def load_test_data_from_dir(config, device):
             
             seq_ids = [hashlib.md5(s.encode()).hexdigest()[:12] for s in sequences]
             
-            # Precompute chybějící embeddingy
-            existing = sum(1 for sid in seq_ids
-                           if os.path.exists(os.path.join(emb_dir, f"{sid}.npy")))
+            existing = sum(1 for sid in seq_ids if os.path.exists(os.path.join(emb_dir, f"{sid}.npy")))
             if existing < len(sequences):
-                esm_extractor = ESMFeatureExtractor(
-                    model_name=config['esm_model']
-                )
+                esm_extractor = ESMFeatureExtractor(model_name=config['esm_model'])
                 esm_extractor.extract_and_save_to_disk(
                     list(zip(seq_ids, sequences)),
-                    output_dir=emb_dir,
-                    max_length=config['max_length']
+                    output_dir=emb_dir, max_length=config['max_length']
                 )
                 del esm_extractor
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                if torch.cuda.is_available(): torch.cuda.empty_cache()
                 gc.collect()
             
             test_seq_dataset = SequenceDataset(
-                sequences, labels,
-                emb_dir=emb_dir,
-                seq_ids=seq_ids,
-                max_length=config['max_length']
+                sequences, labels, emb_dir=emb_dir,
+                seq_ids=seq_ids, max_length=config['max_length']
             )
             print(f"  Test sekvencí (z CSV): {len(test_seq_dataset)}")
     
@@ -338,68 +310,53 @@ def load_test_data_from_dir(config, device):
 
 
 def load_sequences_from_csvs(pos_csv, neg_csv, config):
-    """Načte sekvence z CSV souborů a vytvoří SequenceDataset."""
     from sequence_dataset import SequenceDataset, load_sequences_from_separate_csvs
     from esm2_feature_ex import ESMFeatureExtractor
     
-    sequences, labels = load_sequences_from_separate_csvs(
-        pos_csv, neg_csv, cofactor_filter=config['ligand_name']
-    )
-    
-    if not sequences:
-        return None
+    sequences, labels = load_sequences_from_separate_csvs(pos_csv, neg_csv, cofactor_filter=config['ligand_name'])
+    if not sequences: return None
     
     emb_dir = os.path.join(config['cache_dir'], 'seq_emb_eval_custom')
     os.makedirs(emb_dir, exist_ok=True)
-    
     seq_ids = [hashlib.md5(s.encode()).hexdigest()[:12] for s in sequences]
     
-    existing = sum(1 for sid in seq_ids
-                   if os.path.exists(os.path.join(emb_dir, f"{sid}.npy")))
+    existing = sum(1 for sid in seq_ids if os.path.exists(os.path.join(emb_dir, f"{sid}.npy")))
     if existing < len(sequences):
         esm_extractor = ESMFeatureExtractor(model_name=config['esm_model'])
         esm_extractor.extract_and_save_to_disk(
-            list(zip(seq_ids, sequences)),
-            output_dir=emb_dir,
-            max_length=config['max_length']
+            list(zip(seq_ids, sequences)), output_dir=emb_dir, max_length=config['max_length']
         )
         del esm_extractor
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
         gc.collect()
     
-    return SequenceDataset(
-        sequences, labels,
-        emb_dir=emb_dir,
-        seq_ids=seq_ids,
-        max_length=config['max_length']
-    )
+    return SequenceDataset(sequences, labels, emb_dir=emb_dir, seq_ids=seq_ids, max_length=config['max_length'])
 
 
 # ============================================================
 # Evaluace
 # ============================================================
 def evaluate_sequences(model, test_dataset, device, config, threshold=0.5):
-    """
-    Evaluace sequence branch na testovacím datasetu.
-    
-    Returns:
-        dict s metrikami
-    """
     from torch.utils.data import DataLoader
     from sequence_dataset import collate_sequences
     
     loader = DataLoader(
-        test_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        collate_fn=collate_sequences,
-        num_workers=0
+        test_dataset, batch_size=config['batch_size'],
+        shuffle=False, collate_fn=collate_sequences, num_workers=0
     )
     
-    all_preds = []
-    all_labels = []
-    all_probs = []
+    all_preds, all_labels, all_probs = [], [], []
+    
+    # Sesbírej IDs (seq_ids pokud existují, jinak indexy)
+    all_ids = []
+    if hasattr(test_dataset, 'seq_ids') and test_dataset.seq_ids:
+        sample_ids = test_dataset.seq_ids
+    elif hasattr(test_dataset, 'sequences'):
+        sample_ids = [f"seq_{i}" for i in range(len(test_dataset))]
+    else:
+        sample_ids = [f"seq_{i}" for i in range(len(test_dataset))]
+    
+    idx_offset = 0
     
     model.eval()
     with torch.no_grad():
@@ -408,40 +365,48 @@ def evaluate_sequences(model, test_dataset, device, config, threshold=0.5):
             seq_mask = batch['mask'].to(device)
             labels = batch['labels'].to(device)
             
-            logits, _ = model(
-                mode='sequence',
-                esm_embeddings=esm_emb,
-                seq_mask=seq_mask
-            )
-            
+            logits, _ = model(mode='sequence', esm_embeddings=esm_emb, seq_mask=seq_mask)
             probs = F.softmax(logits, dim=1)[:, 1]
             preds = (probs >= threshold).long()
             
             all_probs.extend(probs.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+            
+            # IDs pro tento batch
+            batch_size = labels.size(0)
+            for i in range(batch_size):
+                if idx_offset + i < len(sample_ids):
+                    all_ids.append(sample_ids[idx_offset + i])
+                else:
+                    all_ids.append(f"seq_{idx_offset + i}")
+            idx_offset += batch_size
     
-    return _compute_metrics(all_labels, all_preds, all_probs, 'sequence')
+    results = _compute_metrics(all_labels, all_preds, all_probs, 'sequence')
+    results['per_sample'] = _build_per_sample_records(all_ids, all_labels, all_preds, all_probs)
+    return results
 
 
 def evaluate_graphs(model, test_graphs, device, config, threshold=0.5):
-    """
-    Evaluace GNN branch na testovacích grafech.
-    
-    Returns:
-        dict s metrikami
-    """
     from torch_geometric.loader import DataLoader as PyGDataLoader
     
-    loader = PyGDataLoader(
-        test_graphs,
-        batch_size=config['batch_size'],
-        shuffle=False
-    )
+    loader = PyGDataLoader(test_graphs, batch_size=config['batch_size'], shuffle=False)
     
-    all_preds = []
-    all_labels = []
-    all_probs = []
+    all_preds, all_labels, all_probs = [], [], []
+    all_ids = []
+    
+    # Sesbírej PDB IDs z grafů
+    graph_ids = []
+    for i, g in enumerate(test_graphs):
+        if hasattr(g, 'pdb_file') and g.pdb_file:
+            # Extrahuj basename bez přípony
+            graph_ids.append(os.path.splitext(os.path.basename(g.pdb_file))[0])
+        elif hasattr(g, 'name') and g.name:
+            graph_ids.append(g.name)
+        else:
+            graph_ids.append(f"graph_{i}")
+    
+    idx_offset = 0
     
     model.eval()
     with torch.no_grad():
@@ -455,12 +420,68 @@ def evaluate_graphs(model, test_graphs, device, config, threshold=0.5):
             all_probs.extend(probs.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(batch.y.cpu().numpy())
+            
+            batch_size = batch.num_graphs
+            for i in range(batch_size):
+                if idx_offset + i < len(graph_ids):
+                    all_ids.append(graph_ids[idx_offset + i])
+                else:
+                    all_ids.append(f"graph_{idx_offset + i}")
+            idx_offset += batch_size
     
-    return _compute_metrics(all_labels, all_preds, all_probs, 'structure')
+    results = _compute_metrics(all_labels, all_preds, all_probs, 'structure')
+    results['per_sample'] = _build_per_sample_records(all_ids, all_labels, all_preds, all_probs)
+    return results
+
+
+def _build_per_sample_records(ids, labels, preds, probs):
+    """Vytvoří seznam per-sample záznamů pro CSV výstup."""
+    records = []
+    for i in range(len(labels)):
+        records.append({
+            'id': ids[i] if i < len(ids) else f"sample_{i}",
+            'true_label': int(labels[i]),
+            'pred_label': int(preds[i]),
+            'pred_prob': float(probs[i]),
+        })
+    return records
+
+
+def save_predictions_csv(all_results, csv_path):
+    """Uloží per-sample predikce do CSV souboru.
+    
+    Sloupce: branch, id, true_label, pred_label, pred_prob
+    """
+    import csv
+    
+    rows = []
+    for branch_name, results in all_results.items():
+        per_sample = results.get('per_sample', [])
+        for record in per_sample:
+            rows.append({
+                'branch': branch_name,
+                'id': record['id'],
+                'true_label': record['true_label'],
+                'pred_label': record['pred_label'],
+                'pred_prob': f"{record['pred_prob']:.6f}",
+            })
+    
+    if not rows:
+        print(f"  ⚠ Žádné per-sample záznamy pro CSV")
+        return
+    
+    os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else '.', exist_ok=True)
+    
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['branch', 'id', 'true_label', 'pred_label', 'pred_prob'])
+        writer.writeheader()
+        writer.writerows(rows)
+    
+    print(f"  ✓ Per-sample predikce uloženy do {csv_path} ({len(rows)} záznamů)")
 
 
 def _compute_metrics(labels, preds, probs, branch_name):
-    """Spočítá kompletní metriky."""
+    """Spočítá kompletní metriky a uloží podklady pro křivky."""
     labels = np.array(labels)
     preds = np.array(preds)
     probs = np.array(probs)
@@ -477,13 +498,19 @@ def _compute_metrics(labels, preds, probs, branch_name):
         'accuracy': float(accuracy),
     }
     
-    # AUC, F1, AP (vyžadují obě třídy)
     if len(set(labels)) > 1:
         results['auc_roc'] = float(roc_auc_score(labels, probs))
         results['average_precision'] = float(average_precision_score(labels, probs))
         results['f1'] = float(f1_score(labels, preds, zero_division=0))
         results['precision'] = float(precision_score(labels, preds, zero_division=0))
         results['recall'] = float(recall_score(labels, preds, zero_division=0))
+        
+        # PŘIDÁNO: Extrakce bodů pro křivky (uložíme si je jako pole k následnému vykreslení)
+        fpr, tpr, thresholds_roc = roc_curve(labels, probs)
+        prec_vals, rec_vals, thresholds_pr = precision_recall_curve(labels, probs)
+        
+        results['roc_curve_data'] = {'fpr': fpr.tolist(), 'tpr': tpr.tolist()}
+        results['pr_curve_data'] = {'precision': prec_vals.tolist(), 'recall': rec_vals.tolist()}
         
         # Confusion matrix
         cm = confusion_matrix(labels, preds)
@@ -494,7 +521,6 @@ def _compute_metrics(labels, preds, probs, branch_name):
         results['tp'] = int(cm[1, 1])
         
         # Optimální threshold (Youden's J)
-        fpr, tpr, thresholds_roc = roc_curve(labels, probs)
         j_scores = tpr - fpr
         best_idx = np.argmax(j_scores)
         results['optimal_threshold'] = float(thresholds_roc[best_idx])
@@ -504,6 +530,60 @@ def _compute_metrics(labels, preds, probs, branch_name):
         results['note'] = 'Pouze jedna třída v testovacích datech'
     
     return results
+
+
+# PŘIDÁNO: Vykreslovací funkce
+def plot_evaluation_curves(all_results, plot_dir):
+    """Vykreslí a uloží ROC a PR křivky ze všech vyhodnocených větví."""
+    if not all_results: return
+    os.makedirs(plot_dir, exist_ok=True)
+    
+    # 1. ROC Křivka
+    plt.figure(figsize=(8, 6))
+    for branch, res in all_results.items():
+        if 'roc_curve_data' in res:
+            fpr = res['roc_curve_data']['fpr']
+            tpr = res['roc_curve_data']['tpr']
+            auc = res.get('auc_roc', 0)
+            plt.plot(fpr, tpr, lw=2, label=f"{branch.capitalize()} (AUC = {auc:.4f})")
+            
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Náhodný model')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate (FPR)')
+    plt.ylabel('True Positive Rate (TPR / Recall)')
+    plt.title('Receiver Operating Characteristic (ROC)')
+    plt.legend(loc="lower right")
+    plt.grid(alpha=0.3)
+    
+    roc_path = os.path.join(plot_dir, 'roc_curve.png')
+    plt.savefig(roc_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # 2. Precision-Recall Křivka
+    plt.figure(figsize=(8, 6))
+    for branch, res in all_results.items():
+        if 'pr_curve_data' in res:
+            prec = res['pr_curve_data']['precision']
+            rec = res['pr_curve_data']['recall']
+            ap = res.get('average_precision', 0)
+            plt.plot(rec, prec, lw=2, label=f"{branch.capitalize()} (AP = {ap:.4f})")
+            
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Křivka')
+    plt.legend(loc="lower left")
+    plt.grid(alpha=0.3)
+    
+    pr_path = os.path.join(plot_dir, 'pr_curve.png')
+    plt.savefig(pr_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"\n  Grafy uloženy do: {plot_dir}")
+    print(f"   - {roc_path}")
+    print(f"   - {pr_path}")
 
 
 def print_results(results, title=""):
@@ -542,37 +622,23 @@ def print_results(results, title=""):
 # Predikce jedné sekvence
 # ============================================================
 def predict_single_sequence(model, sequence, device, config):
-    """
-    Predikce pro jednu sekvenci (sequence branch).
-    
-    Returns:
-        dict s pravděpodobností a predikcí
-    """
     from esm2_feature_ex import ESMFeatureExtractor
-    
     print(f"  Sekvence: {sequence[:50]}... ({len(sequence)} AA)")
     
-    # ESM embedding
     esm_extractor = ESMFeatureExtractor(model_name=config['esm_model'])
     truncated = sequence[:config['max_length']]
     emb = esm_extractor.extract_embeddings(truncated)
     
     del esm_extractor
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
     gc.collect()
     
-    # Tensorize + batch dim
-    emb_tensor = torch.FloatTensor(emb).unsqueeze(0).to(device)  # [1, L, 1280]
+    emb_tensor = torch.FloatTensor(emb).unsqueeze(0).to(device)
     mask = torch.zeros(1, emb_tensor.shape[1], dtype=torch.bool).to(device)
     
     model.eval()
     with torch.no_grad():
-        logits, _ = model(
-            mode='sequence',
-            esm_embeddings=emb_tensor,
-            seq_mask=mask
-        )
+        logits, _ = model(mode='sequence', esm_embeddings=emb_tensor, seq_mask=mask)
         probs = F.softmax(logits, dim=1)
     
     prob_bind = probs[0, 1].item()
@@ -587,12 +653,8 @@ def predict_single_sequence(model, sequence, device, config):
 
 
 def predict_from_fasta(model, fasta_path, device, config):
-    """Predikce pro všechny sekvence ve FASTA souboru."""
-    sequences = []
-    headers = []
-    
-    current_header = None
-    current_seq = []
+    sequences, headers = [], []
+    current_header, current_seq = None, []
     
     with open(fasta_path, 'r') as f:
         for line in f:
@@ -616,9 +678,7 @@ def predict_from_fasta(model, fasta_path, device, config):
     
     print(f"  Načteno {len(sequences)} sekvencí z {fasta_path}")
     
-    # Batch predikce pomocí ESM
     from esm2_feature_ex import ESMFeatureExtractor
-    
     esm_extractor = ESMFeatureExtractor(model_name=config['esm_model'])
     
     results = []
@@ -632,11 +692,7 @@ def predict_from_fasta(model, fasta_path, device, config):
         mask = torch.zeros(1, emb_tensor.shape[1], dtype=torch.bool).to(device)
         
         with torch.no_grad():
-            logits, _ = model(
-                mode='sequence',
-                esm_embeddings=emb_tensor,
-                seq_mask=mask
-            )
+            logits, _ = model(mode='sequence', esm_embeddings=emb_tensor, seq_mask=mask)
             probs = F.softmax(logits, dim=1)
         
         prob_bind = probs[0, 1].item()
@@ -646,14 +702,14 @@ def predict_from_fasta(model, fasta_path, device, config):
             'length': len(seq),
             'probability_binds': prob_bind,
             'prediction': 'BINDS' if prob_bind >= 0.5 else 'NO BIND',
+            "prediction_binary": 1 if prob_bind >= 0.5 else 0
         })
         
         if (i + 1) % 10 == 0:
             print(f"  Zpracováno {i+1}/{len(sequences)}")
     
     del esm_extractor
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
     gc.collect()
     
     return results
@@ -665,7 +721,6 @@ def predict_from_fasta(model, fasta_path, device, config):
 def main():
     args = parse_args()
     
-    # Device
     if args.device:
         device = torch.device(args.device)
     else:
@@ -735,30 +790,23 @@ def main():
     # ---- Načtení testovacích dat ----
     test_graphs = None
     test_seq_dataset = None
-    
     all_results = {}
     
     if args.load_splits:
         print(f"\n  Načítám splity z: {args.load_splits}")
-        
         if args.mode in ('sequence', 'all'):
-            test_seq_dataset = load_test_sequences_from_splits(
-                args.load_splits, config, device
-            )
-        
+            test_seq_dataset = load_test_sequences_from_splits(args.load_splits, config, device)
         if args.mode in ('structure', 'both', 'all'):
             test_graphs = load_test_graphs_from_splits(args.load_splits)
-    
+            
     elif args.test_data:
         print(f"\n  Načítám testovací data z data/{config['ligand_name']}/test/")
         test_graphs, test_seq_dataset = load_test_data_from_dir(config, device)
-    
+        
     elif args.seq_positive_csv or args.seq_negative_csv:
         print(f"\n  Načítám sekvence z CSV souborů")
-        test_seq_dataset = load_sequences_from_csvs(
-            args.seq_positive_csv, args.seq_negative_csv, config
-        )
-    
+        test_seq_dataset = load_sequences_from_csvs(args.seq_positive_csv, args.seq_negative_csv, config)
+        
     else:
         print("\n  ⚠ Nebyl zadán zdroj testovacích dat.")
         print("    Použijte --load-splits, --test-data, --seq-positive-csv/--seq-negative-csv")
@@ -768,21 +816,19 @@ def main():
     # ---- Evaluace ----
     if args.mode in ('sequence', 'all') and test_seq_dataset is not None:
         print(f"\n  Evaluuji SEQUENCE branch...")
-        seq_results = evaluate_sequences(
-            model, test_seq_dataset, device, config,
-            threshold=args.threshold
-        )
+        seq_results = evaluate_sequences(model, test_seq_dataset, device, config, threshold=args.threshold)
         all_results['sequence'] = seq_results
         print_results(seq_results, "Sequence Branch – Test")
     
     if args.mode in ('structure', 'both', 'all') and test_graphs is not None:
         print(f"\n  Evaluuji STRUCTURE (GNN) branch...")
-        gnn_results = evaluate_graphs(
-            model, test_graphs, device, config,
-            threshold=args.threshold
-        )
+        gnn_results = evaluate_graphs(model, test_graphs, device, config, threshold=args.threshold)
         all_results['structure'] = gnn_results
         print_results(gnn_results, "Structure (GNN) Branch – Test")
+    
+    # PŘIDÁNO: Vykreslení a uložení grafů (pokud je zadán plot_dir a máme výsledky pro nějakou větev)
+    if args.plot_dir and all_results:
+        plot_evaluation_curves(all_results, args.plot_dir)
     
     # Souhrn
     if len(all_results) > 1:
@@ -810,12 +856,21 @@ def main():
     
     # Uložení výsledků
     if args.output and all_results:
+        # Odstraníme data křivek a per-sample záznamy, aby JSON nebyl obrovský
+        clean_results = {}
+        for k, v in all_results.items():
+            clean_results[k] = {k2: v2 for k2, v2 in v.items() 
+                                if k2 not in ('roc_curve_data', 'pr_curve_data', 'per_sample')}
+        
         with open(args.output, 'w') as f:
-            json.dump(all_results, f, indent=2, default=str)
+            json.dump(clean_results, f, indent=2, default=str)
         print(f"\n  Výsledky uloženy do {args.output}")
     
+    # CSV metadata (per-sample predikce)
+    if args.csv_output and all_results:
+        save_predictions_csv(all_results, args.csv_output)
+    
     print(f"\n  Hotovo.")
-
 
 if __name__ == '__main__':
     main()
