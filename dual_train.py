@@ -223,6 +223,8 @@ class DualTrainer:
         # Střídáme: sequence batch, graph batch, sequence batch, ...
         seq_done = (seq_iter is None)
         graph_done = (graph_iter is None)
+        seq_batch = None
+        graph_batch = None
         
         while not (seq_done and graph_done):
             # ---- Sequence batch ----
