@@ -3,11 +3,11 @@ Dual-branch Trainer: trénuje na PDB strukturách I sekvencích.
 
 Trénovací strategie:
   1. Sekvence-only batche  – trénují Seq branch + sdílený classifier
-  2. Struktura-only batche – trénují GNN branch + sdílený classifier  
-  3. Oba současně batche   – trénují obě větve + consistency loss
+  2. Both batche           – trénují obě větve + sdílený classifier + consistency loss
+     (každý PDB protein má i sekvenci → struct-only fáze je redundantní)
 
 Typický scénář:
-  - 500 PDB struktur s NAD (strukturní data)
+  - 500 PDB struktur s NAD (strukturní data → both loader: graf + ESM)
   - 10 000 sekvencí z UniProt s NAD anotací (sekvenční data)
   → Model se učí na obou, sdílený classifier se učí z mnohem více dat
 """
@@ -145,13 +145,17 @@ class DualTrainer:
     Trainer pro DualBranchPredictor.
     
     Střídá batche z:
-      - graph_loader (PDB strukturní data → GNN branch)
       - seq_loader (sekvence bez struktury → Sequence branch)
-      - (volitelně) both_loader (PDB data procházejí oběma větvemi)
+      - both_loader (PDB data → obě větve + consistency loss)
+    
+    Struct-only fáze byla odstraněna: každý PDB protein má i sekvenci,
+    takže both_loader plně nahrazuje struct-only trénink.
+    GNN branch se trénuje výhradně přes both batche.
     """
     
     def __init__(self, model, 
-                 graph_train_loader, graph_val_loader,
+                 both_train_loader, 
+                 graph_val_loader,
                  seq_train_loader, seq_val_loader,
                  device='cuda',
                  lr=0.001,
@@ -162,18 +166,18 @@ class DualTrainer:
         """
         Args:
             model: DualBranchPredictor
-            graph_train_loader: PyG DataLoader (PDB grafy)
-            graph_val_loader: PyG DataLoader
+            both_train_loader: DataLoader pro PDB data (graf + ESM embeddings)
+            graph_val_loader: PyG DataLoader (pro per-branch validaci GNN)
             seq_train_loader: torch DataLoader (sekvence)
             seq_val_loader: torch DataLoader
-            consistency_weight: váha consistency loss (0 = vypnuto)
+            consistency_weight: váha consistency loss
             seq_weight: váha sequence loss
-            struct_weight: váha structure loss
+            struct_weight: váha CE loss v both batchi
         """
         self.model = model.to(device)
         self.device = device
         
-        self.graph_train_loader = graph_train_loader
+        self.both_train_loader = both_train_loader
         self.graph_val_loader = graph_val_loader
         self.seq_train_loader = seq_train_loader
         self.seq_val_loader = seq_val_loader
@@ -199,17 +203,20 @@ class DualTrainer:
     
     def train_epoch(self):
         """
-        Jeden epoch: střídá batche ze struct a seq loaderů.
+        Jeden epoch: střídá batche ze seq a both loaderů.
         
         Strategie: interleaved training
-          1. Batch ze seq loaderu → train seq branch
-          2. Batch z graph loaderu → train gnn branch (+ optional consistency)
+          1. Batch ze seq loaderu → train seq branch + classifier
+          2. Batch z both loaderu → train obě větve + classifier + consistency
           3. Opakovat
+        
+        Struct-only fáze odstraněna: both loader ji plně nahrazuje,
+        protože každý PDB protein má i sekvenci.
         """
         self.model.train()
         
         total_loss = 0.0
-        total_struct_loss = 0.0
+        total_both_loss = 0.0
         total_seq_loss = 0.0
         total_consistency_loss = 0.0
         correct = 0
@@ -218,15 +225,15 @@ class DualTrainer:
         
         # Iterátory (None loader = přeskočit danou větev)
         seq_iter = iter(self.seq_train_loader) if self.seq_train_loader else None
-        graph_iter = iter(self.graph_train_loader) if self.graph_train_loader else None
+        both_iter = iter(self.both_train_loader) if self.both_train_loader else None
         
-        # Střídáme: sequence batch, graph batch, sequence batch, ...
+        # Střídáme: sequence batch, both batch, sequence batch, ...
         seq_done = (seq_iter is None)
-        graph_done = (graph_iter is None)
+        both_done = (both_iter is None)
         seq_batch = None
-        graph_batch = None
+        both_batch = None
         
-        while not (seq_done and graph_done):
+        while not (seq_done and both_done):
             # ---- Sequence batch ----
             if not seq_done:
                 try:
@@ -260,40 +267,46 @@ class DualTrainer:
                 total += seq_labels.size(0)
                 n_batches += 1
             
-            # ---- Graph batch ----
-            if not graph_done:
+            # ---- Both batch (graf + sekvence + consistency) ----
+            if not both_done:
                 try:
-                    graph_batch = next(graph_iter)
+                    both_batch = next(both_iter)
                 except StopIteration:
-                    graph_done = True
-                    graph_batch = None
+                    both_done = True
+                    both_batch = None
             
-            if graph_batch is not None:
+            if both_batch is not None:
                 self.optimizer.zero_grad()
                 
-                graph_batch = graph_batch.to(self.device)
+                graph_data = both_batch['graph'].to(self.device)
+                esm_emb = both_batch['esm_embeddings'].to(self.device)
+                seq_mask = both_batch['mask'].to(self.device)
+                labels = both_batch['labels'].to(self.device)
                 
-                # Struktura pouze
                 logits, embeddings = self.model(
-                    mode='structure',
-                    graph_data=graph_batch
+                    mode='both',
+                    graph_data=graph_data,
+                    esm_embeddings=esm_emb,
+                    seq_mask=seq_mask
                 )
                 
-                struct_loss = self.criterion(
-                    logits, graph_batch.y
-                ) * self.struct_weight
+                # Classification loss (obě větve → fúze → classifier)
+                cls_loss = self.criterion(logits, labels) * self.struct_weight
                 
-                loss = struct_loss
-                total_struct_loss += struct_loss.item()
+                # Consistency loss
+                consistency_loss = self.model.get_consistency_loss(embeddings)
                 
+                loss = cls_loss + self.consistency_weight * consistency_loss
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
                 
+                total_both_loss += cls_loss.item()
+                total_consistency_loss += consistency_loss.item()
                 total_loss += loss.item()
                 pred = logits.argmax(dim=1)
-                correct += (pred == graph_batch.y).sum().item()
-                total += graph_batch.num_graphs
+                correct += (pred == labels).sum().item()
+                total += labels.size(0)
                 n_batches += 1
         
         if total == 0:
@@ -301,58 +314,13 @@ class DualTrainer:
         
         metrics = {
             'total_loss': total_loss / n_batches,
-            'struct_loss': total_struct_loss / max(1, n_batches),
+            'both_loss': total_both_loss / max(1, n_batches),
             'seq_loss': total_seq_loss / max(1, n_batches),
             'consistency_loss': total_consistency_loss / max(1, n_batches),
             'accuracy': correct / total
         }
         
         return metrics['total_loss'], metrics['accuracy'], metrics
-    
-    def train_epoch_with_consistency(self, both_loader):
-        """
-        Trénuje s consistency loss na PDB datech,
-        kde můžeme pustit OBOJE (graf i sekvenci).
-        
-        both_loader: DataLoader, kde každý batch obsahuje
-        graf data I ESM embeddings celé sekvence.
-        
-        Volat po standardním train_epoch() pro extra consistency.
-        """
-        self.model.train()
-        total_consistency = 0.0
-        n = 0
-        
-        for batch in both_loader:
-            self.optimizer.zero_grad()
-            
-            graph_data = batch['graph'].to(self.device)
-            esm_emb = batch['esm_embeddings'].to(self.device)
-            seq_mask = batch['mask'].to(self.device)
-            labels = batch['labels'].to(self.device)
-            
-            logits, embeddings = self.model(
-                mode='both',
-                graph_data=graph_data,
-                esm_embeddings=esm_emb,
-                seq_mask=seq_mask
-            )
-            
-            # Classification loss
-            cls_loss = self.criterion(logits, labels)
-            
-            # Consistency loss
-            consistency_loss = self.model.get_consistency_loss(embeddings)
-            
-            loss = cls_loss + self.consistency_weight * consistency_loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            
-            total_consistency += consistency_loss.item()
-            n += 1
-        
-        return total_consistency / max(1, n)
     
     def validate(self):
         """Validace na obou typech dat."""
@@ -491,18 +459,20 @@ class DualTrainer:
         
         return results
     
-    def train(self, num_epochs=100, both_loader=None, patience=10,
+    def train(self, num_epochs=100, patience=10,
               model_name='best_dual_model.pth'):
         """
         Hlavní trénovací smyčka s early stopping a cosine annealing LR.
         
+        GNN branch se trénuje výhradně přes both batche (graf + sekvence
+        + consistency loss). Struct-only fáze byla odstraněna.
+        
         Args:
             num_epochs: maximální počet epoch
-            both_loader: volitelný loader pro consistency training
-            patience: počet epoch bez zlepšení AUC pro early stopping
+            patience: počet epoch bez zlepšení AP pro early stopping
             model_name: název souboru pro uložení nejlepšího modelu
         """
-        best_auc = 0
+        best_ap = 0
         best_val_loss = float('inf')
         no_improve = 0
         
@@ -519,13 +489,8 @@ class DualTrainer:
         for epoch in range(num_epochs):
             current_lr = self.optimizer.param_groups[0]['lr']
             
-            # ---- Train ----
+            # ---- Train (seq + both interleaved) ----
             train_loss, train_acc, train_metrics = self.train_epoch()
-            
-            # Consistency (volitelné, pokud máme PDB data s ESM emb.)
-            consistency = 0.0
-            if both_loader is not None and self.consistency_weight > 0:
-                consistency = self.train_epoch_with_consistency(both_loader)
             
             # ---- Validate ----
             val_loss, val_acc, val_auc, val_f1, val_ap = self.validate()
@@ -539,10 +504,9 @@ class DualTrainer:
             # Logging
             print(f"Epoch {epoch+1}/{num_epochs} (lr={current_lr:.6f})")
             print(f"  Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
-            print(f"    Struct loss: {train_metrics.get('struct_loss', 0):.4f}, "
-                  f"Seq loss: {train_metrics.get('seq_loss', 0):.4f}")
-            if consistency > 0:
-                print(f"    Consistency loss: {consistency:.4f}")
+            print(f"    Both loss: {train_metrics.get('both_loss', 0):.4f}, "
+                  f"Seq loss: {train_metrics.get('seq_loss', 0):.4f}, "
+                  f"Consistency: {train_metrics.get('consistency_loss', 0):.4f}")
             print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, "
                   f"AUC: {val_auc:.4f}, F1: {val_f1:.4f}, AP: {val_ap:.4f}")
             if 'gnn_auc' in branch_metrics:
@@ -556,21 +520,21 @@ class DualTrainer:
                       f"AP: {branch_metrics['seq_ap']:.4f} "
                       f"(n={branch_metrics['seq_n']})")
             
-            # Save best model + early stopping
-            if val_auc > best_auc:
-                best_auc = val_auc
+            # Save best model + early stopping (based on Average Precision)
+            if val_ap > best_ap:
+                best_ap = val_ap
                 no_improve = 0
                 torch.save(self.model.state_dict(), model_name)
-                print(f"  → New best AUC: {best_auc:.4f} (model uložen jako {model_name})")
+                print(f"  → New best AP: {best_ap:.4f} (model uložen jako {model_name})")
             else:
                 no_improve += 1
                 print(f"  (no improvement {no_improve}/{patience})")
                 if no_improve >= patience:
                     print(f"\n  ⚠ Early stopping at epoch {epoch+1} "
-                          f"(no AUC improvement for {patience} epochs)")
+                          f"(no AP improvement for {patience} epochs)")
                     break
         
-        print(f"\nTraining complete. Best AUC: {best_auc:.4f}")
+        print(f"\nTraining complete. Best AP: {best_ap:.4f}")
         
         # Načti nejlepší model zpět
         try:
@@ -608,8 +572,8 @@ if __name__ == '__main__':
     # from binding_site_graph import BindingSiteGraphDataset
     # dataset = BindingSiteGraphDataset(binding_sites, ...)
     # train_graphs, val_graphs = train_test_split(dataset.graphs, ...)
-    # graph_train_loader = PyGDataLoader(train_graphs, batch_size=32)
     # graph_val_loader = PyGDataLoader(val_graphs, batch_size=32)
+    # both_loader = BothDataset(dataset, train_indices, emb_dir)
     
     # ---- 2. Sekvenční data (UniProt) ----
     # sequences, labels = load_sequences_from_csv('data/nad_sequences.csv')
@@ -636,7 +600,7 @@ if __name__ == '__main__':
     # ---- 4. Trainer ----
     # trainer = DualTrainer(
     #     model=model,
-    #     graph_train_loader=graph_train_loader,
+    #     both_train_loader=both_loader,  # PDB data: graf + sekvence
     #     graph_val_loader=graph_val_loader,
     #     seq_train_loader=seq_train_loader,
     #     seq_val_loader=seq_val_loader,

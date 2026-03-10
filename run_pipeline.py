@@ -868,9 +868,6 @@ def train_dual(config, graph_dataset, seq_dataset=None):
         print("\n  ✓ Prepare-only režim – datasety připraveny, trénink přeskočen.")
         return None
     
-    graph_train_loader = PyGDataLoader(
-        train_graphs, batch_size=config['batch_size_graph'], shuffle=True
-    )
     graph_val_loader = PyGDataLoader(
         val_graphs, batch_size=config['batch_size_graph']
     )
@@ -954,11 +951,10 @@ def train_dual(config, graph_dataset, seq_dataset=None):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Model: {total_params:,} parametrů")
     
-    # ---- Both loader (consistency loss: graf + full-seq ESM) ----
+    # ---- Both loader (graf + full-seq ESM → obě větve + consistency) ----
+    # Každý PDB protein má i sekvenci → both loader plně nahrazuje struct-only
     both_loader = None
-    if (config.get('consistency_weight', 0) > 0 
-            and len(train_graphs) > 0 
-            and train_indices is not None):
+    if len(train_graphs) > 0 and train_indices is not None:
         both_loader = _build_both_loader(
             graph_dataset, train_indices, config, device
         )
@@ -966,7 +962,7 @@ def train_dual(config, graph_dataset, seq_dataset=None):
     # ---- Trainer ----
     trainer = DualTrainer(
         model=model,
-        graph_train_loader=graph_train_loader,
+        both_train_loader=both_loader,
         graph_val_loader=graph_val_loader,
         seq_train_loader=seq_train_loader,
         seq_val_loader=seq_val_loader,
@@ -980,7 +976,6 @@ def train_dual(config, graph_dataset, seq_dataset=None):
     # ---- Trénink s early stopping ----
     trainer.train(
         num_epochs=config['num_epochs'],
-        both_loader=both_loader,
         patience=config.get('early_stopping_patience', 10)
     )
 
@@ -1104,10 +1099,10 @@ def train_seq_only(config, seq_dataset):
     print(f"    Seq branch: {seq_params:,}, Classifier: {cls_params:,}")
     print(f"    (GNN branch existuje, ale nebude trénován)")
     
-    # ---- Trainer (graph_train_loader = None → trénuje jen seq branch) ----
+    # ---- Trainer (both_train_loader = None → trénuje jen seq branch) ----
     trainer = DualTrainer(
         model=model,
-        graph_train_loader=None,   # Žádné grafy
+        both_train_loader=None,    # Žádné grafy
         graph_val_loader=None,     # Žádné grafy
         seq_train_loader=seq_train_loader,
         seq_val_loader=seq_val_loader,
@@ -1121,7 +1116,6 @@ def train_seq_only(config, seq_dataset):
     # ---- Trénink ----
     trainer.train(
         num_epochs=config['num_epochs'],
-        both_loader=None,          # Žádný consistency loader
         patience=config.get('early_stopping_patience', 10),
         model_name='best_seq_only_model.pth'
     )
@@ -1203,10 +1197,7 @@ def train_struct_with_own_seq(config, graph_dataset):
         print("\n  ✓ Prepare-only režim – datasety připraveny, trénink přeskočen.")
         return None
     
-    # ---- Graph loaders ----
-    graph_train_loader = PyGDataLoader(
-        train_graphs, batch_size=config['batch_size_graph'], shuffle=True
-    )
+    # ---- Graph val loader ----
     graph_val_loader = PyGDataLoader(
         val_graphs, batch_size=config['batch_size_graph']
     )
@@ -1326,11 +1317,9 @@ def train_struct_with_own_seq(config, graph_dataset):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Model: {total_params:,} parametrů")
     
-    # ---- Both loader (consistency loss) ----
+    # ---- Both loader (graf + full-seq ESM → obě větve + consistency) ----
     both_loader = None
-    if (config.get('consistency_weight', 0) > 0
-            and len(train_graphs) > 0
-            and train_indices is not None):
+    if len(train_graphs) > 0 and train_indices is not None:
         both_loader = _build_both_loader(
             graph_dataset, train_indices, config, device
         )
@@ -1338,7 +1327,7 @@ def train_struct_with_own_seq(config, graph_dataset):
     # ---- Trainer ----
     trainer = DualTrainer(
         model=model,
-        graph_train_loader=graph_train_loader,
+        both_train_loader=both_loader,
         graph_val_loader=graph_val_loader,
         seq_train_loader=seq_train_loader,
         seq_val_loader=seq_val_loader,
@@ -1352,7 +1341,6 @@ def train_struct_with_own_seq(config, graph_dataset):
     # ---- Trénink ----
     trainer.train(
         num_epochs=config['num_epochs'],
-        both_loader=both_loader,
         patience=config.get('early_stopping_patience', 10),
         model_name='best_struct_only_model.pth'
     )

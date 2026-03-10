@@ -114,7 +114,7 @@ class Trainer:
         return avg_loss, accuracy, auc, f1, ap
     
     def train(self, num_epochs=100):
-        best_auc = 0
+        best_ap = 0
         
         for epoch in range(num_epochs):
             # Train
@@ -124,7 +124,7 @@ class Trainer:
             val_loss, val_acc, val_auc, val_f1, val_ap = self.validate()
             
             # LR scheduling
-            self.scheduler.step(val_auc)
+            self.scheduler.step(val_ap)
             
             # Logging
             print(f"Epoch {epoch+1}/{num_epochs}")
@@ -132,11 +132,11 @@ class Trainer:
             print(f"  Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, "
                   f"AUC: {val_auc:.4f}, F1: {val_f1:.4f}, AP: {val_ap:.4f}")
             
-            # Save best model
-            if val_auc > best_auc:
-                best_auc = val_auc
+            # Save best model (based on Average Precision)
+            if val_ap > best_ap:
+                best_ap = val_ap
                 torch.save(self.model.state_dict(), 'best_model.pth')
-                print(f"  → New best AUC: {best_auc:.4f}")
+                print(f"  → New best AP: {best_ap:.4f}")
 
 
 if __name__ == '__main__':
